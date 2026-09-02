@@ -2,9 +2,7 @@ version: "3.8"
 
 services:
     matrix-line:
-        build:
-            context: .
-            dockerfile: Dockerfile
+        image: ghcr.io/misakohoshino/line:latest
         volumes:
             - ./data:/data
         restart: unless-stopped
