@@ -1,8 +1,20 @@
-version: "3.8"
-
 services:
     matrix-line:
         image: ghcr.io/misakohoshino/line:latest
         volumes:
             - ./data:/data
+        environment:
+            DIVA_WEBHOOK_URL: http://diva-worker:8080/line/inbound
+        depends_on:
+            - diva-worker
+        restart: unless-stopped
+
+    diva-worker:
+        image: python:3.13-slim
+        working_dir: /app
+        command: ["python", "-u", "/app/diva_worker.py"]
+        volumes:
+            - ./diva_worker.py:/app/diva_worker.py:ro
+        expose:
+            - "8080"
         restart: unless-stopped
