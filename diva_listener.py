@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """DIVA minimum inbound experiment.
 
-Tails the matrix-line container's structured [DIVA_RX] events and prints only
+Streams the matrix-line container's structured [DIVA_RX] events and prints only
 what the Python worker needs for the first Server B validation:
 text, LINE group ID, sender ID, and LINE message ID.
 
@@ -49,16 +49,34 @@ def parse_diva_line(line: str) -> dict[str, str] | None:
     return fields
 
 
+def get_container_id(repo_dir: Path) -> str:
+    result = subprocess.run(
+        ["docker", "compose", "ps", "-q", "matrix-line"],
+        cwd=repo_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    container_id = result.stdout.strip()
+    if result.returncode != 0 or not container_id:
+        detail = result.stderr.strip() or "matrix-line container not found"
+        raise RuntimeError(detail)
+    return container_id
+
+
 def main() -> int:
     repo_dir = Path(__file__).resolve().parent
-    command = [
-        "docker",
-        "compose",
-        "logs",
-        "--since=1s",
-        "-f",
-        "matrix-line",
-    ]
+
+    try:
+        container_id = get_container_id(repo_dir)
+    except RuntimeError as exc:
+        print(f"Cannot find running matrix-line container: {exc}", file=sys.stderr)
+        return 1
+
+    # Use docker logs directly instead of `docker compose logs -f`.
+    # Compose can buffer output when its stdout is piped into Python on some setups.
+    command = ["docker", "logs", "--since=1s", "-f", container_id]
 
     print("DIVA Python listener started. Waiting for LINE group messages...", flush=True)
 
