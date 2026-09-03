@@ -2,7 +2,10 @@
 """Minimal DIVA inbound worker for Server B.
 
 Receives LINE group events directly from the Go bridge over Docker's internal
-network and prints the four fields required for the first validation.
+network and prints the four fields required for validation.
+
+Smoke-test rule only:
+- exact inbound text "123456654" -> ask Go bridge to reply "789" to the same chat.
 
 No Supabase access and no driver/order logic yet.
 """
@@ -14,10 +17,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "0.0.0.0"
 PORT = 8080
+TEST_TRIGGER = "123456654"
+TEST_REPLY = "789"
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "DIVAWorker/0.1"
+    server_version = "DIVAWorker/0.2"
 
     def log_message(self, fmt: str, *args: object) -> None:
         # Keep output clean; accepted events are printed explicitly below.
@@ -62,7 +67,12 @@ class Handler(BaseHTTPRequestHandler):
         print(f"SENDER_ID: {payload['sender_id']}", flush=True)
         print(f"MESSAGE_ID: {payload['message_id']}", flush=True)
 
-        self._send_json(200, {"ok": True})
+        response: dict[str, object] = {"ok": True}
+        if payload["text"] == TEST_TRIGGER:
+            response["reply_text"] = TEST_REPLY
+            print(f"AUTO_REPLY: {TEST_REPLY}", flush=True)
+
+        self._send_json(200, response)
 
 
 def main() -> None:
