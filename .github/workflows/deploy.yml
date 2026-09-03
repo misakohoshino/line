@@ -21,6 +21,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Prepare DIVA adapter build
+        run: python3 scripts/prepare_diva_build.py
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
