@@ -133,6 +133,19 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 	senderID := makeUserID(msg.From)
 	bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, portalIDStr, opType)
 
+	// DIVA minimum inbound experiment: emit the decrypted LINE group message
+	// before Matrix portal handling, so Matrix room errors cannot hide the raw event.
+	if ToType(msg.ToType) == ToRoom || ToType(msg.ToType) == ToGroup {
+		lc.UserLogin.Bridge.Log.Info().
+			Str("diva_event", "DIVA_RX").
+			Str("text", unwrappedText).
+			Str("group_id", portalIDStr).
+			Str("sender_id", msg.From).
+			Str("message_id", msg.ID).
+			Bool("decryption_failed", decryptionFailed).
+			Msg("[DIVA_RX]")
+	}
+
 	messageEvent := &simplevent.Message[line.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventMessage,
