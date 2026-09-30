@@ -202,6 +202,7 @@ func TestDIVAControlRejectsBadRequests(t *testing.T) {
 		{"missing request_id", withField(func(b map[string]any) { delete(b, "request_id") }), 400, outboundInvalidRequest},
 		{"request_id not UUID", withField(func(b map[string]any) { b["request_id"] = "abc" }), 400, outboundInvalidRequest},
 		{"bad chat_id", withField(func(b map[string]any) { b["target"] = map[string]any{"chat_id": "group-1"} }), 400, outboundInvalidRequest},
+		{"direct user chat_id", withField(func(b map[string]any) { b["target"] = map[string]any{"chat_id": sendTestPeer} }), 400, outboundInvalidRequest},
 		{"bad account_mid", withField(func(b map[string]any) {
 			b["target"] = map[string]any{"chat_id": sendTestGroup, "account_mid": "nope"}
 		}), 400, outboundInvalidRequest},
@@ -251,6 +252,34 @@ func TestDIVAControlSendsText(t *testing.T) {
 	}
 	if _, ok := sent[0].Msg.ContentMetadata["MENTION"]; ok {
 		t.Fatal("unexpected MENTION metadata")
+	}
+}
+
+// The endpoint refuses direct (u...) targets but still sends to rooms, and the
+// shared send core keeps its direct-chat path.
+func TestDIVAControlTargetsGroupsAndRoomsOnly(t *testing.T) {
+	h := newDIVAControlHarness(t, divaControlConfig{})
+
+	status, got := h.post(t, divaTextBody(newDIVARequestID(), sendTestPeer, "hi"))
+	requireDIVAError(t, status, got, http.StatusBadRequest, outboundInvalidRequest, deliveryNotSent)
+	if !strings.Contains(got.Error.Detail, "direct (u...) targets are not allowed") {
+		t.Fatalf("detail = %q", got.Error.Detail)
+	}
+	if n := len(h.env.fake.snapshot()); n != 0 {
+		t.Fatalf("LINE calls after direct target = %d", n)
+	}
+
+	const room = "rroom0000000000000000000000000000"
+	status, got = h.post(t, divaTextBody(newDIVARequestID(), room, "hi room"))
+	requireDIVAOK(t, status, got)
+	sent := h.env.fake.sentMessages(t)
+	if len(sent) != 1 || sent[0].Msg.To != room || sent[0].Msg.Text != "hi room" {
+		t.Fatalf("sent = %+v", sent)
+	}
+
+	res, err := h.env.lc.sendLineOutbound(context.Background(), &lineOutboundRequest{ChatMID: sendTestPeer, ContentType: ContentText, Text: "dm"})
+	if err != nil || res == nil || res.Sent == nil {
+		t.Fatalf("shared core direct send: res=%+v err=%v", res, err)
 	}
 }
 
