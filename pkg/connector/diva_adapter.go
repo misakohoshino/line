@@ -8,13 +8,11 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
-	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
 )
 
 const (
@@ -217,7 +215,7 @@ func (lc *LineClient) forwardDIVAInbound(payload []byte, groupID, messageID stri
 
 		sendCtx, sendCancel := context.WithTimeout(context.Background(), defaultDIVASendTimeout)
 		defer sendCancel()
-		if err := lc.sendDIVAText(sendCtx, groupID, replyText); err != nil {
+		if err := lc.sendDIVAReplyText(sendCtx, groupID, replyText); err != nil {
 			lc.UserLogin.Bridge.Log.Error().Err(err).
 				Str("group_id", groupID).
 				Str("message_id", messageID).
@@ -233,103 +231,18 @@ func (lc *LineClient) forwardDIVAInbound(payload []byte, groupID, messageID stri
 	}()
 }
 
-// sendDIVAText sends one text message to a LINE chat using the same group E2EE
-// behavior as the normal Matrix->LINE send path. This is deliberately narrow:
-// text only, for the Server B command-path smoke test.
-func (lc *LineClient) sendDIVAText(ctx context.Context, groupID, text string) error {
-	groupID = strings.TrimSpace(groupID)
-	if groupID == "" || strings.TrimSpace(text) == "" {
+// sendDIVAReplyText sends the worker's reply_text back to the chat the event
+// came from, through the shared LINE send core (same E2EE, group key and
+// fallback behaviour as a Matrix text message).
+func (lc *LineClient) sendDIVAReplyText(ctx context.Context, chatMID, text string) error {
+	chatMID = strings.TrimSpace(chatMID)
+	if chatMID == "" || strings.TrimSpace(text) == "" {
 		return errors.New("DIVA send requires group_id and text")
 	}
-
-	client := lc.newClient()
-	plainText := lc.E2EE == nil || lc.isGroupNoE2EE(groupID)
-	contentMetadata := map[string]string{}
-	var chunks []string
-
-	if !plainText {
-		contentMetadata["e2eeVersion"] = "2"
-		if errFetch := lineFetchAndUnwrapGroupKey(lc, ctx, groupID, 0); errFetch != nil {
-			if errors.Is(errFetch, ltsm.ErrAbort) {
-				return errFetch
-			}
-			if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
-				return errFetch
-			}
-		}
-
-		var err error
-		chunks, err = e2eeEncryptGroupMessage(lc.E2EE, groupID, lc.midOrFallback(), text)
-		if err != nil {
-			if errors.Is(err, ltsm.ErrAbort) {
-				return err
-			}
-			if errFetch := lineFetchAndUnwrapGroupKey(lc, ctx, groupID, 0); errFetch == nil {
-				chunks, err = e2eeEncryptGroupMessage(lc.E2EE, groupID, lc.midOrFallback(), text)
-			} else if errors.Is(errFetch, ltsm.ErrAbort) {
-				return errFetch
-			} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
-				return errFetch
-			}
-			if err != nil {
-				lc.markGroupNoE2EE(groupID)
-				plainText = true
-				chunks = nil
-				delete(contentMetadata, "e2eeVersion")
-			}
-		}
-	}
-
-	buildMessage := func() (*line.Message, int) {
-		now := time.Now().UnixMilli()
-		msg := &line.Message{
-			ID:              "local-diva-" + strconv.FormatInt(now, 10),
-			From:            lc.midOrFallback(),
-			To:              groupID,
-			ToType:          int(guessToType(groupID)),
-			SessionID:       0,
-			CreatedTime:     json.Number(strconv.FormatInt(now, 10)),
-			ContentType:     int(ContentText),
-			HasContent:      false,
-			ContentMetadata: contentMetadata,
-		}
-		if plainText {
-			msg.Text = text
-		} else {
-			msg.Chunks = chunks
-		}
-		return msg, int(now % 1_000_000_000)
-	}
-
-	lineMsg, reqSeq := buildMessage()
-	lc.trackReqSeq(reqSeq)
-	var sentMsg *line.Message
-	var err error
-	client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
-		return client.SendMessage(int64(reqSeq), lineMsg)
+	_, err := lc.sendLineOutbound(ctx, &lineOutboundRequest{
+		ChatMID:     chatMID,
+		ContentType: ContentText,
+		Text:        text,
 	})
-	_ = sentMsg
-
-	if err != nil && !plainText && line.IsGroupKeyNotRegisteredError(err) {
-		if regErr := lineAutoRegisterGroupKey(lc, ctx, groupID); regErr != nil {
-			return regErr
-		}
-		if fetchErr := lineFetchAndUnwrapGroupKey(lc, ctx, groupID, 0); fetchErr != nil {
-			return fetchErr
-		}
-		chunks, err = e2eeEncryptGroupMessage(lc.E2EE, groupID, lc.midOrFallback(), text)
-		if err != nil {
-			return err
-		}
-		lineMsg, reqSeq = buildMessage()
-		lineMsg.Chunks = chunks
-		lineMsg.Text = ""
-		lc.trackReqSeq(reqSeq)
-		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
-			return client.SendMessage(int64(reqSeq), lineMsg)
-		})
-		_ = sentMsg
-	}
-
 	return err
 }

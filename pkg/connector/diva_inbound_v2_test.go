@@ -355,8 +355,8 @@ func TestHandleDIVAInboundV2ForwardsBackfillWithoutReplying(t *testing.T) {
 		t.Fatal("v2 backfill event was not forwarded")
 	}
 
-	// The worker asked for a reply. Reaching sendDIVAText here would panic on
-	// the empty test client; the adapter must refuse and log instead.
+	// The worker asked for a reply. The adapter must refuse and log instead of
+	// reaching the LINE send core.
 	deadline := time.Now().Add(2 * time.Second)
 	for !strings.Contains(logs.String(), "backfilled event, not sending") {
 		if time.Now().After(deadline) {
