@@ -29,9 +29,12 @@ const (
 type LineConnector struct {
 	br              *bridgev2.Bridge
 	loginFinalizeMu sync.Mutex
+	// divaControl is the DIVA outbound endpoint, nil when disabled.
+	divaControl *divaControlServer
 }
 
 var _ bridgev2.NetworkConnector = (*LineConnector)(nil)
+var _ bridgev2.StoppableNetwork = (*LineConnector)(nil)
 
 func (lc *LineConnector) Init(bridge *bridgev2.Bridge) {
 	// Keep connection state in Beeper's bridge status API only. Framework status
@@ -46,7 +49,13 @@ func (lc *LineConnector) Start(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("matrix connector does not implement MatrixConnectorWithServer")
 	}
+	lc.divaControl = startDIVAControl(lc.br)
 	return nil
+}
+
+// Stop shuts down the DIVA outbound endpoint when the bridge stops.
+func (lc *LineConnector) Stop() {
+	lc.divaControl.stop(5 * time.Second)
 }
 
 func (lc *LineConnector) GetBridgeInfoVersion() (info, capabilities int) {

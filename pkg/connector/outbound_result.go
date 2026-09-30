@@ -19,9 +19,9 @@ type outboundErrorCode string
 
 const (
 	outboundInvalidRequest         outboundErrorCode = "INVALID_REQUEST"
-	outboundUnauthorized           outboundErrorCode = "UNAUTHORIZED" // reserved: endpoint auth (PR 4)
+	outboundUnauthorized           outboundErrorCode = "UNAUTHORIZED" // endpoint auth only
 	outboundUnsupportedMessageType outboundErrorCode = "UNSUPPORTED_MESSAGE_TYPE"
-	outboundNoActiveLogin          outboundErrorCode = "NO_ACTIVE_LOGIN" // reserved: endpoint login selection (PR 4)
+	outboundNoActiveLogin          outboundErrorCode = "NO_ACTIVE_LOGIN" // endpoint login selection only
 	outboundLineSessionInvalid     outboundErrorCode = "LINE_SESSION_INVALID"
 	outboundTargetNotFound         outboundErrorCode = "TARGET_NOT_FOUND"
 	outboundBlocked                outboundErrorCode = "BLOCKED"
@@ -65,11 +65,14 @@ const (
 
 // outboundResult is the result model for one outbound send.
 type outboundResult struct {
-	OK      bool                   `json:"ok"`
-	Message *outboundResultMessage `json:"message,omitempty"`
+	// RequestID echoes the caller's request_id (DIVA outbound endpoint).
+	RequestID string                 `json:"request_id,omitempty"`
+	OK        bool                   `json:"ok"`
+	Message   *outboundResultMessage `json:"message,omitempty"`
 	// Fallbacks is never null.
 	Fallbacks []outboundFallback `json:"fallbacks"`
-	// Deduplicated is reserved for request_id dedupe (PR 4); always false here.
+	// Deduplicated is true when this response did not start a new send because
+	// the request_id was already known.
 	Deduplicated bool                 `json:"deduplicated"`
 	Error        *outboundResultError `json:"error,omitempty"`
 }
