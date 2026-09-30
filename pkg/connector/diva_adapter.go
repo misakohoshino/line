@@ -249,7 +249,7 @@ func (lc *LineClient) sendDIVAText(ctx context.Context, groupID, text string) er
 
 	if !plainText {
 		contentMetadata["e2eeVersion"] = "2"
-		if errFetch := lc.fetchAndUnwrapGroupKey(ctx, groupID, 0); errFetch != nil {
+		if errFetch := lineFetchAndUnwrapGroupKey(lc, ctx, groupID, 0); errFetch != nil {
 			if errors.Is(errFetch, ltsm.ErrAbort) {
 				return errFetch
 			}
@@ -259,13 +259,13 @@ func (lc *LineClient) sendDIVAText(ctx context.Context, groupID, text string) er
 		}
 
 		var err error
-		chunks, err = lc.E2EE.EncryptGroupMessage(groupID, lc.midOrFallback(), text)
+		chunks, err = e2eeEncryptGroupMessage(lc.E2EE, groupID, lc.midOrFallback(), text)
 		if err != nil {
 			if errors.Is(err, ltsm.ErrAbort) {
 				return err
 			}
-			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, groupID, 0); errFetch == nil {
-				chunks, err = lc.E2EE.EncryptGroupMessage(groupID, lc.midOrFallback(), text)
+			if errFetch := lineFetchAndUnwrapGroupKey(lc, ctx, groupID, 0); errFetch == nil {
+				chunks, err = e2eeEncryptGroupMessage(lc.E2EE, groupID, lc.midOrFallback(), text)
 			} else if errors.Is(errFetch, ltsm.ErrAbort) {
 				return errFetch
 			} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
@@ -311,13 +311,13 @@ func (lc *LineClient) sendDIVAText(ctx context.Context, groupID, text string) er
 	_ = sentMsg
 
 	if err != nil && !plainText && line.IsGroupKeyNotRegisteredError(err) {
-		if regErr := lc.autoRegisterGroupKey(ctx, groupID); regErr != nil {
+		if regErr := lineAutoRegisterGroupKey(lc, ctx, groupID); regErr != nil {
 			return regErr
 		}
-		if fetchErr := lc.fetchAndUnwrapGroupKey(ctx, groupID, 0); fetchErr != nil {
+		if fetchErr := lineFetchAndUnwrapGroupKey(lc, ctx, groupID, 0); fetchErr != nil {
 			return fetchErr
 		}
-		chunks, err = lc.E2EE.EncryptGroupMessage(groupID, lc.midOrFallback(), text)
+		chunks, err = e2eeEncryptGroupMessage(lc.E2EE, groupID, lc.midOrFallback(), text)
 		if err != nil {
 			return err
 		}
