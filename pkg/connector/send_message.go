@@ -70,7 +70,180 @@ func lineGroupE2EEFetchFailureError(err error) error {
 	return err
 }
 
+// lineOutboundRequest is one message for the shared LINE send core. It holds
+// no Matrix types: the Matrix and DIVA adapters each translate their own input
+// into it.
+type lineOutboundRequest struct {
+	// ChatMID is the LINE chat to send to: a group (c...), room (r...) or user (u...).
+	ChatMID     string
+	ContentType ContentType
+	// Text is the message text for ContentText.
+	Text string
+	// Media is required for image, video, audio and file.
+	Media *outboundMedia
+	// MentionMeta is merged into the LINE content metadata (the MENTION key).
+	MentionMeta map[string]string
+	// ReplyToID is the LINE server message ID to reply to, or empty.
+	ReplyToID string
+	// ReplyFallback resends without the reply relation when LINE cannot find
+	// the reply target. When false, that failure is returned as an error.
+	ReplyFallback bool
+}
+
+// outboundMedia describes media for the send core. Either Data is set, or Load
+// fetches the bytes at the point in the send flow where they are needed.
+type outboundMedia struct {
+	Data []byte
+	Load func(ctx context.Context) ([]byte, error)
+	// MimeType is used for images (GIF and PNG detection).
+	MimeType string
+	// FileName may be empty; the core then uses "image.<ext>" or "file.bin".
+	FileName string
+	// Duration in milliseconds for video and audio; 0 when unknown.
+	Duration int
+}
+
+func (m *outboundMedia) load(ctx context.Context) ([]byte, error) {
+	if m == nil {
+		return nil, errors.New("media message without media")
+	}
+	if m.Load != nil {
+		return m.Load(ctx)
+	}
+	return m.Data, nil
+}
+
+// lineOutboundResult describes what the send core actually did.
+type lineOutboundResult struct {
+	// Sent is the message as returned by LINE; Sent.ID is the server message ID.
+	Sent *line.Message
+	// SentPlaintext is true when the message went out without E2EE.
+	SentPlaintext bool
+	// ReplyDropped is true when the reply relation was removed after LINE
+	// could not find the reply target.
+	ReplyDropped bool
+	// ZipWrapped is true when a file was re-sent wrapped in a ZIP archive.
+	ZipWrapped bool
+	// SentAt is the local time stamped on the outgoing message.
+	SentAt time.Time
+}
+
+// errLineOutboundBlocked is returned when the target user is blocked on LINE.
+var errLineOutboundBlocked = errors.New("user is blocked on LINE: unblock them on your phone to send messages")
+
+// HandleMatrixMessage is the Matrix adapter for the shared LINE send core. It
+// resolves everything that depends on Matrix (event content, media download,
+// ghost mentions, reply lookup) and maps the result back to a Matrix response.
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
+	req := &lineOutboundRequest{
+		ChatMID:       string(msg.Portal.ID),
+		Text:          msg.Content.Body,
+		ReplyFallback: true,
+	}
+
+	// Detect media files sent as MsgFile and handle them with the correct LINE content type.
+	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
+	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
+	effectiveMsgType := msg.Content.MsgType
+	if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
+		mime := msg.Content.Info.MimeType
+		if strings.HasPrefix(mime, "audio/") {
+			effectiveMsgType = event.MsgAudio
+		} else if strings.HasPrefix(mime, "video/") {
+			effectiveMsgType = event.MsgVideo
+		} else if strings.HasPrefix(mime, "image/") {
+			effectiveMsgType = event.MsgImage
+		}
+	}
+
+	downloadAs := func(kind string) func(context.Context) ([]byte, error) {
+		return func(ctx context.Context) ([]byte, error) {
+			data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+			if err != nil {
+				return nil, fmt.Errorf("failed to download %s from matrix: %w", kind, err)
+			}
+			return data, nil
+		}
+	}
+	switch effectiveMsgType {
+	case event.MsgText:
+		req.ContentType = ContentText
+	case event.MsgImage:
+		req.ContentType = ContentImage
+		req.Media = &outboundMedia{
+			Load:     downloadAs("media"),
+			MimeType: msg.Content.Info.MimeType,
+			FileName: msg.Content.GetFileName(),
+		}
+	case event.MsgFile:
+		req.ContentType = ContentFile
+		req.Media = &outboundMedia{Load: downloadAs("file"), FileName: msg.Content.GetFileName()}
+	case event.MsgVideo:
+		req.ContentType = ContentVideo
+		req.Media = &outboundMedia{Load: downloadAs("video"), Duration: msg.Content.Info.Duration}
+	case event.MsgAudio:
+		req.ContentType = ContentAudio
+		req.Media = &outboundMedia{Load: downloadAs("audio")}
+		if msg.Content.Info != nil {
+			req.Media.Duration = msg.Content.Info.Duration
+		}
+	default:
+		return nil, fmt.Errorf("message type %s not implemented", effectiveMsgType)
+	}
+
+	// Process mentions — set MENTION content metadata for LINE notification
+	if msg.Content.Mentions == nil {
+		msg.Content.Mentions = &event.Mentions{}
+	}
+	// Detect implicit @room/@all/@everyone in body for LINE group-wide mentions
+	if !msg.Content.Mentions.Room {
+		lowerBody := strings.ToLower(msg.Content.Body)
+		if strings.Contains(lowerBody, "@room") || strings.Contains(lowerBody, "@all") || strings.Contains(lowerBody, "@everyone") {
+			msg.Content.Mentions.Room = true
+		}
+	}
+	req.MentionMeta = lc.buildMentionMetadata(ctx, msg.Content.Body, msg.Content.FormattedBody, msg.Content.Mentions)
+
+	var relatedMsg *database.Message
+
+	if msg.ReplyTo != nil {
+		relatedMsg = msg.ReplyTo
+	} else if msg.Content.RelatesTo != nil && msg.Content.RelatesTo.InReplyTo != nil {
+		replyToMXID := msg.Content.RelatesTo.InReplyTo.EventID
+		if replyToMXID != "" {
+			dbMsg, err := lc.UserLogin.Bridge.DB.Message.GetPartByMXID(ctx, replyToMXID)
+			if err == nil && dbMsg != nil {
+				relatedMsg = dbMsg
+			}
+		}
+	}
+
+	if relatedMsg != nil && relatedMsg.ID != "" && !strings.HasPrefix(string(relatedMsg.ID), "local-") {
+		req.ReplyToID = string(relatedMsg.ID)
+	}
+
+	result, err := lc.sendLineOutbound(ctx, req)
+	if errors.Is(err, errLineOutboundBlocked) {
+		return nil, bridgev2.WrapErrorInStatus(err).
+			WithIsCertain(true).
+			WithSendNotice(true).
+			WithErrorReason(event.MessageStatusGenericError)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &bridgev2.MatrixMessageResponse{
+		DB: &database.Message{
+			ID:        networkid.MessageID(result.Sent.ID),
+			SenderID:  makeUserID(string(lc.UserLogin.ID)),
+			Timestamp: result.SentAt,
+		},
+	}, nil
+}
+
+func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundRequest) (*lineOutboundResult, error) {
+	result := &lineOutboundResult{}
 	client := lc.newClient()
 	callLineErr := func(call func(*line.Client) error) error {
 		var err error
@@ -91,7 +264,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		})
 		return sentMsg, err
 	}
-	portalMid := string(msg.Portal.ID)
+	portalMid := req.ChatMID
 	fromMid := lc.midOrFallback()
 
 	lowerPortalID := strings.ToLower(portalMid)
@@ -99,10 +272,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 	// Block sends to blocked contacts in DMs.
 	if !isGroup && lc.isUserBlocked(portalMid) {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("user is blocked on LINE: unblock them on your phone to send messages")).
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusGenericError)
+		return nil, errLineOutboundBlocked
 	}
 
 	// Determine whether we need to send as plain text (peer/group has Letter Sealing off).
@@ -132,26 +302,11 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentMetadata["e2eeVersion"] = "2"
 	}
 
-	// Detect media files sent as MsgFile and handle them with the correct LINE content type.
-	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
-	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
-	effectiveMsgType := msg.Content.MsgType
-	if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
-		mime := msg.Content.Info.MimeType
-		if strings.HasPrefix(mime, "audio/") {
-			effectiveMsgType = event.MsgAudio
-		} else if strings.HasPrefix(mime, "video/") {
-			effectiveMsgType = event.MsgVideo
-		} else if strings.HasPrefix(mime, "image/") {
-			effectiveMsgType = event.MsgImage
-		}
-	}
-
 	// For non-text messages, check with the server whether to use E2EE or plain media upload.
 	// This must happen before media processing since it affects the upload path.
 	useE2EEMedia := !plainText
-	if useE2EEMedia && effectiveMsgType != event.MsgText {
-		mediaContentType := contentTypeForMsgType(effectiveMsgType)
+	if useE2EEMedia && req.ContentType != ContentText {
+		mediaContentType := int(req.ContentType)
 		if !lc.shouldUseE2EEMediaFlow(portalMid, mediaContentType) {
 			lc.UserLogin.Bridge.Log.Info().
 				Str("portal", portalMid).
@@ -180,25 +335,25 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var rawFileData []byte
 	var rawFileName string
 
-	switch effectiveMsgType {
-	case event.MsgText:
+	switch req.ContentType {
+	case ContentText:
 		contentType = int(ContentText)
 		if plainText {
-			plainTextBody = msg.Content.Body
+			plainTextBody = req.Text
 		} else {
-			payload, err = json.Marshal(map[string]string{"text": msg.Content.Body})
+			payload, err = json.Marshal(map[string]string{"text": req.Text})
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal text payload: %w", err)
 			}
 		}
 
-	case event.MsgImage:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+	case ContentImage:
+		data, err := req.Media.load(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download media from matrix: %w", err)
+			return nil, err
 		}
 
-		mimeType := msg.Content.Info.MimeType
+		mimeType := req.Media.MimeType
 		isGif := mimeType == "image/gif"
 		isAnimated := isGif && isAnimatedGif(data)
 
@@ -232,7 +387,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 
-			fileName := msg.Content.GetFileName()
+			fileName := req.Media.FileName
 			if fileName == "" {
 				fileName = "image." + extension
 			}
@@ -306,7 +461,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 			contentMetadata["ENC_KM"] = keyMaterialB64
 
-			fileName := msg.Content.GetFileName()
+			fileName := req.Media.FileName
 			if fileName == "" {
 				fileName = "image." + extension
 			}
@@ -328,15 +483,15 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			payload, _ = json.Marshal(imgPayload)
 		}
 
-	case event.MsgFile:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+	case ContentFile:
+		data, err := req.Media.load(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download file from matrix: %w", err)
+			return nil, err
 		}
 
 		contentType = int(ContentFile)
 
-		fileName := msg.Content.GetFileName()
+		fileName := req.Media.FileName
 		if fileName == "" {
 			fileName = "file.bin"
 		}
@@ -393,18 +548,18 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				Msg("Prepared file message")
 		}
 
-	case event.MsgVideo:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+	case ContentVideo:
+		data, err := req.Media.load(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download video from matrix: %w", err)
+			return nil, err
 		}
 
 		contentType = int(ContentVideo)
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 		contentMetadata["contentType"] = fmt.Sprintf("%d", ContentVideo)
 
-		if msg.Content.Info.Duration > 0 {
-			contentMetadata["DURATION"] = fmt.Sprintf("%d", msg.Content.Info.Duration)
+		if req.Media.Duration > 0 {
+			contentMetadata["DURATION"] = fmt.Sprintf("%d", req.Media.Duration)
 		}
 
 		if plainText {
@@ -524,19 +679,19 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				Msg("Prepared video message")
 		}
 
-	case event.MsgAudio:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+	case ContentAudio:
+		data, err := req.Media.load(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download audio from matrix: %w", err)
+			return nil, err
 		}
 
 		contentType = int(ContentAudio)
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 		contentMetadata["contentType"] = fmt.Sprintf("%d", ContentAudio)
 
-		if msg.Content.Info != nil && msg.Content.Info.Duration > 0 {
-			contentMetadata["DURATION"] = fmt.Sprintf("%d", msg.Content.Info.Duration)
-			contentMetadata["AUDLEN"] = fmt.Sprintf("%d", msg.Content.Info.Duration)
+		if req.Media.Duration > 0 {
+			contentMetadata["DURATION"] = fmt.Sprintf("%d", req.Media.Duration)
+			contentMetadata["AUDLEN"] = fmt.Sprintf("%d", req.Media.Duration)
 		}
 
 		if plainText {
@@ -572,22 +727,11 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	default:
-		return nil, fmt.Errorf("message type %s not implemented", effectiveMsgType)
+		return nil, fmt.Errorf("content type %d not implemented", req.ContentType)
 	}
 
-	// Process mentions — set MENTION content metadata for LINE notification
-	if msg.Content.Mentions == nil {
-		msg.Content.Mentions = &event.Mentions{}
-	}
-	// Detect implicit @room/@all/@everyone in body for LINE group-wide mentions
-	if !msg.Content.Mentions.Room {
-		lowerBody := strings.ToLower(msg.Content.Body)
-		if strings.Contains(lowerBody, "@room") || strings.Contains(lowerBody, "@all") || strings.Contains(lowerBody, "@everyone") {
-			msg.Content.Mentions.Room = true
-		}
-	}
-	mentionMeta := lc.buildMentionMetadata(ctx, msg.Content.Body, msg.Content.FormattedBody, msg.Content.Mentions)
-	for k, v := range mentionMeta {
+	// MENTION content metadata for LINE notification, prepared by the caller.
+	for k, v := range req.MentionMeta {
 		contentMetadata[k] = v
 	}
 
@@ -606,7 +750,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			if contentType != int(ContentText) {
 				chunks, err = e2eeEncryptGroupMessageRaw(lc.E2EE, portalMid, fromMid, contentType, payload)
 			} else {
-				chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, msg.Content.Body)
+				chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, req.Text)
 			}
 			if err != nil {
 				if errors.Is(err, ltsm.ErrAbort) {
@@ -616,7 +760,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					if contentType != int(ContentText) {
 						chunks, err = e2eeEncryptGroupMessageRaw(lc.E2EE, portalMid, fromMid, contentType, payload)
 					} else {
-						chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, msg.Content.Body)
+						chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, req.Text)
 					}
 				} else if errors.Is(errFetch, ltsm.ErrAbort) {
 					return nil, errFetch
@@ -636,7 +780,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					err = nil
 					delete(contentMetadata, "e2eeVersion")
 					if contentType == int(ContentText) {
-						plainTextBody = msg.Content.Body
+						plainTextBody = req.Text
 					} else {
 						delete(contentMetadata, "OID")
 						delete(contentMetadata, "SID")
@@ -688,28 +832,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		lineMsg.Chunks = chunks
 	}
 
-	var relatedMsg *database.Message
-
-	if msg.ReplyTo != nil {
-		relatedMsg = msg.ReplyTo
-	} else if msg.Content.RelatesTo != nil && msg.Content.RelatesTo.InReplyTo != nil {
-		replyToMXID := msg.Content.RelatesTo.InReplyTo.EventID
-		if replyToMXID != "" {
-			dbMsg, err := lc.UserLogin.Bridge.DB.Message.GetPartByMXID(ctx, replyToMXID)
-			if err == nil && dbMsg != nil {
-				relatedMsg = dbMsg
-			}
-		}
-	}
-
-	if relatedMsg != nil && relatedMsg.ID != "" && !strings.HasPrefix(string(relatedMsg.ID), "local-") {
-		lineMsg.RelatedMessageID = string(relatedMsg.ID)
+	if req.ReplyToID != "" {
+		lineMsg.RelatedMessageID = req.ReplyToID
 		lineMsg.MessageRelationType = 3
 		lineMsg.RelatedMessageServiceCode = 1
 	}
 
-	reqSeq := int(now % 1_000_000_000)
-	lc.trackReqSeq(reqSeq)
+	reqSeq := lc.nextReqSeq()
 
 	sentMsg, err := sendLineMessage(reqSeq, lineMsg)
 
@@ -717,6 +846,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// Retry by wrapping the file in a ZIP archive (matching Chrome Extension behavior).
 	if err != nil && strings.Contains(err.Error(), "Extension does not support file upload") && rawFileData != nil {
 		lc.UserLogin.Bridge.Log.Info().Str("file_name", rawFileName).Msg("File upload rejected by LINE, retrying with ZIP wrapping")
+		result.ZipWrapped = true
 
 		zipData, zipErr := wrapInZip(rawFileName, rawFileData)
 		if zipErr != nil {
@@ -770,8 +900,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			lineMsg.Chunks = chunks
 		}
 
-		retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-		lc.trackReqSeq(retryReqSeq)
+		retryReqSeq := lc.nextReqSeq()
 
 		sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 	}
@@ -789,7 +918,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					if contentType != int(ContentText) {
 						chunks, err = e2eeEncryptGroupMessageRaw(lc.E2EE, portalMid, fromMid, contentType, payload)
 					} else {
-						chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, msg.Content.Body)
+						chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, req.Text)
 					}
 					if err == nil {
 						lineMsg.Chunks = chunks
@@ -798,8 +927,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				}
 			}
 			if err == nil {
-				retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-				lc.trackReqSeq(retryReqSeq)
+				retryReqSeq := lc.nextReqSeq()
 				sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 			}
 		} else {
@@ -808,17 +936,17 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
-	if shouldRetrySendWithoutReplyRelation(lineMsg, err) {
+	if req.ReplyFallback && shouldRetrySendWithoutReplyRelation(lineMsg, err) {
 		relatedMessageID := lineMsg.RelatedMessageID
 		clearReplyRelation(lineMsg)
+		result.ReplyDropped = true
 		lc.UserLogin.Bridge.Log.Warn().
 			Err(err).
 			Str("chat_mid", portalMid).
 			Str("related_message_id", relatedMessageID).
 			Msg("SendMessage failed because LINE could not find reply target, retrying without reply relation")
 
-		retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-		lc.trackReqSeq(retryReqSeq)
+		retryReqSeq := lc.nextReqSeq()
 		sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 	}
 
@@ -859,13 +987,10 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
-	return &bridgev2.MatrixMessageResponse{
-		DB: &database.Message{
-			ID:        networkid.MessageID(sentMsg.ID),
-			SenderID:  makeUserID(string(lc.UserLogin.ID)),
-			Timestamp: time.UnixMilli(now),
-		},
-	}, nil
+	result.Sent = sentMsg
+	result.SentPlaintext = plainText
+	result.SentAt = time.UnixMilli(now)
+	return result, nil
 }
 
 // wrapInZip creates a ZIP archive containing a single file with the given name and data.
@@ -884,21 +1009,6 @@ func wrapInZip(fileName string, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-func contentTypeForMsgType(msgType event.MessageType) int {
-	switch msgType {
-	case event.MsgImage:
-		return int(ContentImage)
-	case event.MsgVideo:
-		return int(ContentVideo)
-	case event.MsgAudio:
-		return int(ContentAudio)
-	case event.MsgFile:
-		return int(ContentFile)
-	default:
-		return int(ContentText)
-	}
 }
 
 func shouldRetrySendWithoutReplyRelation(msg *line.Message, err error) bool {
