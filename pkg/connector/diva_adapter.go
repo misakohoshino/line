@@ -237,7 +237,7 @@ func (lc *LineClient) forwardDIVAInbound(payload []byte, groupID, messageID stri
 func (lc *LineClient) sendDIVAReplyText(ctx context.Context, chatMID, text string) error {
 	chatMID = strings.TrimSpace(chatMID)
 	if chatMID == "" || strings.TrimSpace(text) == "" {
-		return errors.New("DIVA send requires group_id and text")
+		return markOutboundFailure(failInvalidRequest, errors.New("DIVA send requires group_id and text"))
 	}
 	_, err := lc.sendLineOutbound(ctx, &lineOutboundRequest{
 		ChatMID:     chatMID,
