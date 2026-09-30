@@ -5,6 +5,13 @@ services:
             - ./data:/data
         environment:
             DIVA_WEBHOOK_URL: http://diva-worker:8080/line/inbound
+            # DIVA outbound endpoint (POST /diva/v1/send). Stays off unless a
+            # token of at least 32 characters is set, e.g. in .env.
+            DIVA_CONTROL_TOKEN: ${DIVA_CONTROL_TOKEN:-}
+            DIVA_CONTROL_LISTEN: ":8090"
+        # Docker internal network only. Never publish this port with `ports:`.
+        expose:
+            - "8090"
         depends_on:
             - diva-worker
         restart: unless-stopped
