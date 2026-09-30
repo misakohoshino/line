@@ -61,10 +61,75 @@ const (
 
 var (
 	divaUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	// divaChatMIDPattern accepts only groups (c...) and rooms (r...). Direct
-	// chats (u...) are refused at this endpoint for now; the shared send core
-	// still supports them for Matrix.
-	divaChatMIDPattern   = regexp.MustCompile(`^[cr][0-9A-Za-z]{32}$`)
+	// divaChatMIDPattern accepts LINE group/room chat IDs as opaque identifiers.
+	// Production inbound has shown group IDs beginning with uppercase C and
+	// lengths that are not the old fixed 33-char test shape. Keep only the
+	// business boundary here: group/room (c/C/r/R) allowed, direct user
+	// targets (u/U) refused. The shared send core remains the format authority.
+	divaChatMIDPattern   = regexp.MustCompile(`^[cCrR][0-9A-Za-z]+package connector
+
+// DIVA outbound control endpoint (LINE-1A PR 4).
+//
+//	Server A → POST /diva/v1/send → shared send core → LINE
+//
+// Safety model:
+//   - The listener only starts when DIVA_CONTROL_TOKEN is set (at least 32
+//     characters). Every send needs "Authorization: Bearer <token>".
+//   - It is meant for the Docker internal network: compose must use `expose`,
+//     never `ports`.
+//   - request_id is mandatory. A request_id is either in flight or completed;
+//     a second call with the same request_id never starts a second LINE send.
+//   - line.Client.SendMessage does not take a context, so an HTTP wait budget
+//     (timeout_ms) cannot cancel a LINE send. The send runs in the background;
+//     the handler waits at most timeout_ms and otherwise answers
+//     TIMEOUT / delivery=unknown. The real result is stored under the same
+//     request_id when the send finishes.
+//   - Sends to one chat run in arrival order; different chats run in
+//     parallel up to a global limit.
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"maunium.net/go/mautrix/bridgev2"
+)
+
+const (
+	divaControlDefaultListen  = ":8090"
+	divaControlMinTokenLength = 32
+	divaControlMaxBodyBytes   = 1 << 20
+	divaControlMaxConcurrent  = 4
+	divaControlMaxPending     = 64
+	divaControlMaxEntries     = 10000
+	divaControlResultTTL      = 10 * time.Minute
+	divaControlDefaultWait    = 15 * time.Second
+	divaControlMinWait        = 100 * time.Millisecond
+	divaControlMaxWait        = 30 * time.Second
+	// divaControlSendBudget bounds one background send. The core may make
+	// several LINE calls (retries), each limited by the 30 s HTTP client.
+	divaControlSendBudget = 3 * time.Minute
+)
+
+var (
+	divaUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	)
 	divaUserMIDPattern   = regexp.MustCompile(`^u[0-9A-Za-z]{32}$`)
 	divaMessageIDPattern = regexp.MustCompile(`^[0-9]{1,32}$`)
 )
@@ -153,7 +218,7 @@ func parseDIVASendRequest(body []byte) (*divaSendRequest, *divaSendJob, *divaReq
 		return &raw, nil, invalidRequest("request_id must be a UUID")
 	}
 	if !divaChatMIDPattern.MatchString(raw.Target.ChatID) {
-		return &raw, nil, invalidRequest("target.chat_id must be a LINE group (c...) or room (r...) MID; direct (u...) targets are not allowed")
+		return &raw, nil, invalidRequest("target.chat_id must be a LINE group/room chat ID beginning with c/C or r/R; direct user targets are not allowed")
 	}
 	accountMID := ""
 	if raw.Target.AccountMID != nil {
