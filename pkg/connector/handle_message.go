@@ -111,7 +111,7 @@ func (lc *LineClient) getChatInfoForIncomingMessage(ctx context.Context, portal 
 	return info, nil
 }
 
-func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
+func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int, origin divaOrigin) bool {
 	// Only process known content types; skip system messages (group created, member invited, etc.)
 	if !isBridgeableContentType(msg) {
 		lc.UserLogin.Bridge.Log.Debug().
@@ -135,7 +135,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 
 	// DIVA adapter: hand group/room messages to the DIVA worker before Matrix
 	// portal handling, so Matrix room errors cannot hide the event.
-	lc.handleDIVAInbound(msg, portalIDStr, unwrappedText, decryptionFailed)
+	lc.handleDIVAInbound(msg, portalIDStr, unwrappedText, decryptionFailed, opType, origin)
 
 	messageEvent := &simplevent.Message[line.Message]{
 		EventMeta: simplevent.EventMeta{

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
@@ -43,7 +44,29 @@ const (
 	divaSkipWrappedNotice    = "wrapped_notice"
 	divaSkipDecryptionFailed = "decryption_failed"
 	divaSkipEmptyText        = "empty_text"
+	divaSkipBackfill         = "backfill"
 )
+
+var divaContractWarnOnce sync.Once
+
+// divaContractVersion reads DIVA_CONTRACT_VERSION. Unset or "1" selects the
+// legacy v1 payload, "2" selects the v2 envelope. Any other value falls back
+// to v1, so rolling back is always just unsetting or resetting the variable.
+func (lc *LineClient) divaContractVersion() int {
+	raw := strings.TrimSpace(os.Getenv("DIVA_CONTRACT_VERSION"))
+	switch raw {
+	case "", "1":
+		return 1
+	case "2":
+		return divaContractV2
+	}
+	divaContractWarnOnce.Do(func() {
+		lc.UserLogin.Bridge.Log.Warn().
+			Str("value", raw).
+			Msg("Unknown DIVA_CONTRACT_VERSION, using the v1 inbound contract")
+	})
+	return 1
+}
 
 // divaV1ForwardDecision decides whether an inbound LINE message may be sent to
 // the DIVA worker under the v1 contract, which only has a "text" field.
@@ -70,15 +93,27 @@ func divaV1ForwardDecision(msg *line.Message, text string, decryptionFailed bool
 }
 
 // handleDIVAInbound is the single DIVA hook in the LINE receive path. It only
-// considers group and room messages, logs a content-free debug record, and
-// forwards genuine text messages to the DIVA worker. It is a no-op for the
-// worker unless DIVA_WEBHOOK_URL is set.
-func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool) {
+// considers group and room messages and logs a content-free debug record.
+//
+// Under v1 it forwards genuine live text only; backfill cannot be labelled in
+// v1, so it is not forwarded at all. Under v2 every bridgeable group/room
+// message is forwarded with origin, is_from_me and decryption_failed so Server
+// A can tell them apart. It is a no-op for the worker unless DIVA_WEBHOOK_URL
+// is set.
+func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool, opType int, origin divaOrigin) {
 	if ToType(msg.ToType) != ToRoom && ToType(msg.ToType) != ToGroup {
 		return
 	}
 
-	skipReason := divaV1ForwardDecision(msg, unwrappedText, decryptionFailed)
+	version := lc.divaContractVersion()
+	var skipReason string
+	if version == 1 {
+		if origin != divaOriginLive {
+			skipReason = divaSkipBackfill
+		} else {
+			skipReason = divaV1ForwardDecision(msg, unwrappedText, decryptionFailed)
+		}
+	}
 
 	// Never log message text or decrypted payloads here: for media the
 	// decrypted body contains the media keyMaterial.
@@ -89,6 +124,8 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 		Str("message_id", msg.ID).
 		Int("content_type", msg.ContentType).
 		Bool("decryption_failed", decryptionFailed).
+		Str("origin", string(origin)).
+		Int("contract_version", version).
 		Bool("forward", skipReason == "").
 		Str("skip_reason", skipReason).
 		Msg("[DIVA_RX]")
@@ -96,27 +133,34 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 	if skipReason != "" {
 		return
 	}
-	lc.forwardDIVAInbound(unwrappedText, chatMID, msg.From, msg.ID)
-}
 
-// forwardDIVAInbound forwards a decrypted LINE group message to the local
-// DIVA worker. It is intentionally asynchronous: a DIVA worker outage must
-// never block the LINE receive loop. If the worker returns reply_text, Go sends
-// that text back to the same LINE chat.
-func (lc *LineClient) forwardDIVAInbound(text, groupID, senderID, messageID string) {
-	endpoint := strings.TrimSpace(os.Getenv("DIVA_WEBHOOK_URL"))
-	if endpoint == "" {
+	var payload []byte
+	var err error
+	if version == divaContractV2 {
+		payload, err = json.Marshal(lc.buildDIVAV2Event(msg, chatMID, unwrappedText, decryptionFailed, opType, origin))
+	} else {
+		payload, err = json.Marshal(divaInboundEvent{
+			Text:      unwrappedText,
+			GroupID:   chatMID,
+			SenderID:  msg.From,
+			MessageID: msg.ID,
+		})
+	}
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("message_id", msg.ID).Msg("DIVA adapter failed to encode inbound event")
 		return
 	}
+	lc.forwardDIVAInbound(payload, chatMID, msg.ID, origin == divaOriginLive)
+}
 
-	payload, err := json.Marshal(divaInboundEvent{
-		Text:      text,
-		GroupID:   groupID,
-		SenderID:  senderID,
-		MessageID: messageID,
-	})
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("DIVA adapter failed to encode inbound event")
+// forwardDIVAInbound posts an encoded inbound event to the local DIVA worker.
+// It is intentionally asynchronous: a DIVA worker outage must never block the
+// LINE receive loop. If the worker returns reply_text and allowReply is set,
+// Go sends that text back to the same LINE chat. Backfilled events never get a
+// reply, whatever the worker answers.
+func (lc *LineClient) forwardDIVAInbound(payload []byte, groupID, messageID string, allowReply bool) {
+	endpoint := strings.TrimSpace(os.Getenv("DIVA_WEBHOOK_URL"))
+	if endpoint == "" {
 		return
 	}
 
@@ -161,6 +205,13 @@ func (lc *LineClient) forwardDIVAInbound(text, groupID, senderID, messageID stri
 
 		replyText := strings.TrimSpace(decision.ReplyText)
 		if replyText == "" {
+			return
+		}
+		if !allowReply {
+			lc.UserLogin.Bridge.Log.Warn().
+				Str("group_id", groupID).
+				Str("message_id", messageID).
+				Msg("DIVA worker returned reply_text for a backfilled event, not sending")
 			return
 		}
 
