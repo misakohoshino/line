@@ -105,7 +105,7 @@ type outboundMedia struct {
 
 func (m *outboundMedia) load(ctx context.Context) ([]byte, error) {
 	if m == nil {
-		return nil, errors.New("media message without media")
+		return nil, markOutboundFailure(failInvalidRequest, errors.New("media message without media"))
 	}
 	if m.Load != nil {
 		return m.Load(ctx)
@@ -254,7 +254,8 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 		var err error
 		var res string
 		client, res, err = callLineResultUsing(lc, ctx, client, call)
-		return res, err
+		// callLineString is only used for OBS uploads made before sendMessage.
+		return res, markOutboundFailure(failUpload, err)
 	}
 	sendLineMessage := func(reqSeq int, lineMsg *line.Message) (*line.Message, error) {
 		var err error
@@ -262,7 +263,7 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
 			return client.SendMessage(int64(reqSeq), lineMsg)
 		})
-		return sentMsg, err
+		return sentMsg, markOutboundFailure(failSendAttempt, err)
 	}
 	portalMid := req.ChatMID
 	fromMid := lc.midOrFallback()
@@ -727,7 +728,7 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 		}
 
 	default:
-		return nil, fmt.Errorf("content type %d not implemented", req.ContentType)
+		return nil, markOutboundFailure(failUnsupportedType, fmt.Errorf("content type %d not implemented", req.ContentType))
 	}
 
 	// MENTION content metadata for LINE notification, prepared by the caller.
@@ -794,7 +795,7 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 			// 1-1 Encryption (peer key already fetched above)
 			myRaw, myKeyID, errKey := e2eeMyKeyIDs(lc.E2EE)
 			if errKey != nil {
-				return nil, fmt.Errorf("missing own E2EE key: %w", errKey)
+				return nil, markOutboundFailure(failOwnE2EEKey, fmt.Errorf("missing own E2EE key: %w", errKey))
 			}
 			peerRaw, peerPub, errPeer := lc.ensurePeerKey(ctx, portalMid)
 			if errPeer != nil {
@@ -886,7 +887,7 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 			} else {
 				myRaw, myKeyID, errKey := e2eeMyKeyIDs(lc.E2EE)
 				if errKey != nil {
-					return nil, fmt.Errorf("missing own E2EE key for zip retry: %w", errKey)
+					return nil, markOutboundFailure(failOwnE2EEKey, fmt.Errorf("missing own E2EE key for zip retry: %w", errKey))
 				}
 				peerRaw, peerPub, errPeer := lc.ensurePeerKey(ctx, portalMid)
 				if errPeer != nil {
@@ -951,8 +952,15 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 	}
 
 	if err != nil {
+		if !req.ReplyFallback && shouldRetrySendWithoutReplyRelation(lineMsg, err) {
+			return nil, markOutboundFailure(failReplyTargetMissing, err)
+		}
 		return nil, err
 	}
+
+	result.Sent = sentMsg
+	result.SentPlaintext = plainText
+	result.SentAt = time.UnixMilli(now)
 
 	// For plain media: upload media to r/talk/m/{serverMessageId} after sending
 	if plainText && plainMediaData != nil && sentMsg.ID != "" {
@@ -969,7 +977,8 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 		if err := callLineErr(func(client *line.Client) error {
 			return client.UploadOBSPlain(plainMediaData, sentMsg.ID, obsType)
 		}); err != nil {
-			return nil, fmt.Errorf("failed to upload plain media to OBS: %w", err)
+			// LINE already accepted the message; only the media upload failed.
+			return nil, &outboundFailure{kind: failPostSend, err: fmt.Errorf("failed to upload plain media to OBS: %w", err), result: result}
 		}
 		lc.UserLogin.Bridge.Log.Info().
 			Str("message_id", sentMsg.ID).
@@ -987,9 +996,6 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 		}
 	}
 
-	result.Sent = sentMsg
-	result.SentPlaintext = plainText
-	result.SentAt = time.UnixMilli(now)
 	return result, nil
 }
 
