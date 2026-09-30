@@ -33,6 +33,19 @@ type mentionEntry struct {
 
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
+// Seams for message-level E2EE and group key registration on the send path.
+// Production always uses the real methods. Tests replace them because LTSM
+// cannot export a generated private key, so a test cannot own a real E2EE
+// identity to encrypt with.
+var (
+	e2eeEncryptGroupMessage    = (*e2ee.Manager).EncryptGroupMessage
+	e2eeEncryptGroupMessageRaw = (*e2ee.Manager).EncryptGroupMessageRaw
+	e2eeEncryptMessageV2Raw    = (*e2ee.Manager).EncryptMessageV2Raw
+	e2eeMyKeyIDs               = (*e2ee.Manager).MyKeyIDs
+	lineAutoRegisterGroupKey   = (*LineClient).autoRegisterGroupKey
+	lineFetchAndUnwrapGroupKey = (*LineClient).fetchAndUnwrapGroupKey
+)
+
 const lineGroupE2EEReconnectNotice = "LINE encryption keys for this group are unavailable. Reconnect LINE in Beeper, then try sending again."
 
 func lineGroupE2EEReconnectRequiredError(err error) error {
@@ -581,7 +594,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// Encryption phase — skip entirely for plain text
 	if !plainText {
 		if isGroup {
-			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch != nil {
+			if errFetch := lineFetchAndUnwrapGroupKey(lc, ctx, portalMid, 0); errFetch != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
 				if errors.Is(errFetch, ltsm.ErrAbort) {
 					return nil, errFetch
@@ -591,19 +604,19 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				}
 			}
 			if contentType != int(ContentText) {
-				chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
+				chunks, err = e2eeEncryptGroupMessageRaw(lc.E2EE, portalMid, fromMid, contentType, payload)
 			} else {
-				chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
+				chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, msg.Content.Body)
 			}
 			if err != nil {
 				if errors.Is(err, ltsm.ErrAbort) {
 					return nil, err
 				}
-				if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch == nil {
+				if errFetch := lineFetchAndUnwrapGroupKey(lc, ctx, portalMid, 0); errFetch == nil {
 					if contentType != int(ContentText) {
-						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
+						chunks, err = e2eeEncryptGroupMessageRaw(lc.E2EE, portalMid, fromMid, contentType, payload)
 					} else {
-						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
+						chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, msg.Content.Body)
 					}
 				} else if errors.Is(errFetch, ltsm.ErrAbort) {
 					return nil, errFetch
@@ -635,7 +648,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			}
 		} else {
 			// 1-1 Encryption (peer key already fetched above)
-			myRaw, myKeyID, errKey := lc.E2EE.MyKeyIDs()
+			myRaw, myKeyID, errKey := e2eeMyKeyIDs(lc.E2EE)
 			if errKey != nil {
 				return nil, fmt.Errorf("missing own E2EE key: %w", errKey)
 			}
@@ -644,7 +657,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				return nil, fmt.Errorf("failed to get peer key: %w", errPeer)
 			}
 
-			chunks, err = lc.E2EE.EncryptMessageV2Raw(portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, payload)
+			chunks, err = e2eeEncryptMessageV2Raw(lc.E2EE, portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, payload)
 		}
 
 		if err != nil {
@@ -739,9 +752,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			})
 
 			if isGroup {
-				chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, zipPayload)
+				chunks, err = e2eeEncryptGroupMessageRaw(lc.E2EE, portalMid, fromMid, contentType, zipPayload)
 			} else {
-				myRaw, myKeyID, errKey := lc.E2EE.MyKeyIDs()
+				myRaw, myKeyID, errKey := e2eeMyKeyIDs(lc.E2EE)
 				if errKey != nil {
 					return nil, fmt.Errorf("missing own E2EE key for zip retry: %w", errKey)
 				}
@@ -749,7 +762,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				if errPeer != nil {
 					return nil, fmt.Errorf("failed to get peer key for zip retry: %w", errPeer)
 				}
-				chunks, err = lc.E2EE.EncryptMessageV2Raw(portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, zipPayload)
+				chunks, err = e2eeEncryptMessageV2Raw(lc.E2EE, portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, zipPayload)
 			}
 			if err != nil {
 				return nil, fmt.Errorf("failed to encrypt zipped file message: %w", err)
@@ -768,15 +781,15 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if err != nil && isGroup && line.IsGroupKeyNotRegisteredError(err) {
 		lc.UserLogin.Bridge.Log.Info().Str("chat_mid", portalMid).
 			Msg("SendMessage failed: group key not registered, registering and retrying")
-		if regErr := lc.autoRegisterGroupKey(ctx, portalMid); regErr == nil {
+		if regErr := lineAutoRegisterGroupKey(lc, ctx, portalMid); regErr == nil {
 			lc.UserLogin.Bridge.Log.Info().Str("chat_mid", portalMid).
 				Msg("autoRegisterGroupKey succeeded, retrying send")
 			if !plainText && lc.E2EE != nil {
-				if fetchErr := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); fetchErr == nil {
+				if fetchErr := lineFetchAndUnwrapGroupKey(lc, ctx, portalMid, 0); fetchErr == nil {
 					if contentType != int(ContentText) {
-						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
+						chunks, err = e2eeEncryptGroupMessageRaw(lc.E2EE, portalMid, fromMid, contentType, payload)
 					} else {
-						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
+						chunks, err = e2eeEncryptGroupMessage(lc.E2EE, portalMid, fromMid, msg.Content.Body)
 					}
 					if err == nil {
 						lineMsg.Chunks = chunks
