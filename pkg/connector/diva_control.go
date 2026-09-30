@@ -61,10 +61,12 @@ const (
 
 var (
 	divaUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	// divaChatMIDPattern accepts only groups (c...) and rooms (r...). Direct
-	// chats (u...) are refused at this endpoint for now; the shared send core
-	// still supports them for Matrix.
-	divaChatMIDPattern   = regexp.MustCompile(`^[cr][0-9A-Za-z]{32}$`)
+	// divaChatMIDPattern accepts LINE group/room chat IDs as opaque identifiers.
+	// Production inbound has shown group IDs beginning with uppercase C and
+	// lengths that are not the old fixed 33-char test shape. Keep only the
+	// business boundary here: group/room (c/C/r/R) allowed, direct user
+	// targets (u/U) refused. The shared send core remains the format authority.
+	divaChatMIDPattern   = regexp.MustCompile(`^[cCrR][0-9A-Za-z]+$`)
 	divaUserMIDPattern   = regexp.MustCompile(`^u[0-9A-Za-z]{32}$`)
 	divaMessageIDPattern = regexp.MustCompile(`^[0-9]{1,32}$`)
 )
@@ -153,7 +155,7 @@ func parseDIVASendRequest(body []byte) (*divaSendRequest, *divaSendJob, *divaReq
 		return &raw, nil, invalidRequest("request_id must be a UUID")
 	}
 	if !divaChatMIDPattern.MatchString(raw.Target.ChatID) {
-		return &raw, nil, invalidRequest("target.chat_id must be a LINE group (c...) or room (r...) MID; direct (u...) targets are not allowed")
+		return &raw, nil, invalidRequest("target.chat_id must be a LINE group/room chat ID beginning with c/C or r/R; direct user targets are not allowed")
 	}
 	accountMID := ""
 	if raw.Target.AccountMID != nil {

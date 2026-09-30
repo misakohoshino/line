@@ -262,7 +262,7 @@ func TestDIVAControlTargetsGroupsAndRoomsOnly(t *testing.T) {
 
 	status, got := h.post(t, divaTextBody(newDIVARequestID(), sendTestPeer, "hi"))
 	requireDIVAError(t, status, got, http.StatusBadRequest, outboundInvalidRequest, deliveryNotSent)
-	if !strings.Contains(got.Error.Detail, "direct (u...) targets are not allowed") {
+	if !strings.Contains(got.Error.Detail, "direct user targets are not allowed") {
 		t.Fatalf("detail = %q", got.Error.Detail)
 	}
 	if n := len(h.env.fake.snapshot()); n != 0 {
@@ -272,8 +272,18 @@ func TestDIVAControlTargetsGroupsAndRoomsOnly(t *testing.T) {
 	const room = "rroom0000000000000000000000000000"
 	status, got = h.post(t, divaTextBody(newDIVARequestID(), room, "hi room"))
 	requireDIVAOK(t, status, got)
+
+	// Production inbound chat_id is copied from LINE msg.To. Real groups can
+	// start with uppercase C and are not guaranteed to match the old fixed
+	// 33-char test shape. The control endpoint must pass that opaque ID through.
+	const realWorldGroup = "CCLwvHR9QU3qworV2HYGB3rDhkiIZVsboNB3Wo7qyZfc"
+	status, got = h.post(t, divaTextBody(newDIVARequestID(), realWorldGroup, "hi prod group"))
+	requireDIVAOK(t, status, got)
+
 	sent := h.env.fake.sentMessages(t)
-	if len(sent) != 1 || sent[0].Msg.To != room || sent[0].Msg.Text != "hi room" {
+	if len(sent) != 2 ||
+		sent[0].Msg.To != room || sent[0].Msg.Text != "hi room" ||
+		sent[1].Msg.To != realWorldGroup || sent[1].Msg.Text != "hi prod group" {
 		t.Fatalf("sent = %+v", sent)
 	}
 
