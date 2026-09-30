@@ -795,7 +795,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 		if ContentType(msg.ContentType) == ContentSystem {
 			didQueue = lc.queueHistoricalSystemMessage(msg, int(opType))
 		} else {
-			didQueue = lc.queueIncomingMessage(msg, int(opType))
+			didQueue = lc.queueIncomingMessage(msg, int(opType), divaOriginBackfill)
 		}
 		if didQueue {
 			queued++
@@ -2039,7 +2039,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			if ContentType(op.Message.ContentType) == ContentSystem {
 				lc.handleSystemMessage(op)
 			} else {
-				lc.queueIncomingMessage(op.Message, op.Type)
+				lc.queueIncomingMessage(op.Message, op.Type, divaOriginLive)
 			}
 		}
 

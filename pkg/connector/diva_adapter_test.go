@@ -1,7 +1,6 @@
 package connector
 
 import (
-	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -108,8 +107,8 @@ func startDIVATestWorker(t *testing.T) <-chan []byte {
 // The payload Server A receives must stay the legacy v1 shape until PR 1.
 func TestHandleDIVAInboundForwardsGroupTextAsV1(t *testing.T) {
 	received := startDIVATestWorker(t)
-	var logs bytes.Buffer
-	lc := newDIVATestClient(&logs)
+	logs := &divaSyncBuffer{}
+	lc := newDIVATestClient(logs)
 
 	msg := &line.Message{
 		ID:          "600000000000000001",
@@ -118,7 +117,7 @@ func TestHandleDIVAInboundForwardsGroupTextAsV1(t *testing.T) {
 		ToType:      int(ToGroup),
 		ContentType: int(ContentText),
 	}
-	lc.handleDIVAInbound(msg, "cgroup", "123456654", false)
+	lc.handleDIVAInbound(msg, "cgroup", "123456654", false, int(OpReceiveMessage), divaOriginLive)
 
 	select {
 	case body := <-received:
@@ -144,6 +143,14 @@ func TestHandleDIVAInboundForwardsGroupTextAsV1(t *testing.T) {
 		t.Fatal("group text message was not forwarded to the DIVA worker")
 	}
 
+	// Wait for the async delivery log too, so it is covered by the leak check.
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(logs.String(), "DIVA adapter delivered inbound event") {
+		if time.Now().After(deadline) {
+			t.Fatalf("delivery was not logged: %s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if strings.Contains(logs.String(), "123456654") {
 		t.Fatalf("[DIVA_RX] log leaked message text: %s", logs.String())
 	}
@@ -151,16 +158,16 @@ func TestHandleDIVAInboundForwardsGroupTextAsV1(t *testing.T) {
 
 func TestHandleDIVAInboundWithholdsMediaAndDMs(t *testing.T) {
 	received := startDIVATestWorker(t)
-	var logs bytes.Buffer
-	lc := newDIVATestClient(&logs)
+	logs := &divaSyncBuffer{}
+	lc := newDIVATestClient(logs)
 
 	const keyMaterial = `{"keyMaterial":"c2VjcmV0LWtleS1tYXRlcmlhbA=="}`
 	lc.handleDIVAInbound(&line.Message{
 		ID: "1", From: "usender", To: "cgroup", ToType: int(ToGroup), ContentType: int(ContentImage),
-	}, "cgroup", keyMaterial, false)
+	}, "cgroup", keyMaterial, false, int(OpReceiveMessage), divaOriginLive)
 	lc.handleDIVAInbound(&line.Message{
 		ID: "2", From: "usender", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
-	}, "usender", "123456654", false)
+	}, "usender", "123456654", false, int(OpReceiveMessage), divaOriginLive)
 
 	select {
 	case body := <-received:
