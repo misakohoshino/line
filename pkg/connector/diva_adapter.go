@@ -35,6 +35,70 @@ type divaInboundDecision struct {
 	ReplyText string `json:"reply_text"`
 }
 
+// Reasons a group/room message is withheld from the legacy (v1) DIVA inbound
+// contract. v1 only carries text, so anything that is not a genuine user text
+// message must not be forwarded as if it were one.
+const (
+	divaSkipNotText          = "not_text"
+	divaSkipWrappedNotice    = "wrapped_notice"
+	divaSkipDecryptionFailed = "decryption_failed"
+	divaSkipEmptyText        = "empty_text"
+)
+
+// divaV1ForwardDecision decides whether an inbound LINE message may be sent to
+// the DIVA worker under the v1 contract, which only has a "text" field.
+//
+//   - Non-text content types are withheld: for E2EE media the decrypted body is
+//     the media keyMaterial JSON, not user text.
+//   - Text-typed messages carrying ORGCONTP (call, device contact, and post
+//     notifications) are LINE-generated notices, not user text.
+//   - Messages that failed to decrypt have no text; v1 cannot express that.
+//
+// It returns an empty reason when the message should be forwarded.
+func divaV1ForwardDecision(msg *line.Message, text string, decryptionFailed bool) string {
+	switch {
+	case ContentType(msg.ContentType) != ContentText:
+		return divaSkipNotText
+	case msg.ContentMetadata["ORGCONTP"] != "":
+		return divaSkipWrappedNotice
+	case decryptionFailed:
+		return divaSkipDecryptionFailed
+	case strings.TrimSpace(text) == "":
+		return divaSkipEmptyText
+	}
+	return ""
+}
+
+// handleDIVAInbound is the single DIVA hook in the LINE receive path. It only
+// considers group and room messages, logs a content-free debug record, and
+// forwards genuine text messages to the DIVA worker. It is a no-op for the
+// worker unless DIVA_WEBHOOK_URL is set.
+func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool) {
+	if ToType(msg.ToType) != ToRoom && ToType(msg.ToType) != ToGroup {
+		return
+	}
+
+	skipReason := divaV1ForwardDecision(msg, unwrappedText, decryptionFailed)
+
+	// Never log message text or decrypted payloads here: for media the
+	// decrypted body contains the media keyMaterial.
+	lc.UserLogin.Bridge.Log.Debug().
+		Str("diva_event", "DIVA_RX").
+		Str("group_id", chatMID).
+		Str("sender_id", msg.From).
+		Str("message_id", msg.ID).
+		Int("content_type", msg.ContentType).
+		Bool("decryption_failed", decryptionFailed).
+		Bool("forward", skipReason == "").
+		Str("skip_reason", skipReason).
+		Msg("[DIVA_RX]")
+
+	if skipReason != "" {
+		return
+	}
+	lc.forwardDIVAInbound(unwrappedText, chatMID, msg.From, msg.ID)
+}
+
 // forwardDIVAInbound forwards a decrypted LINE group message to the local
 // DIVA worker. It is intentionally asynchronous: a DIVA worker outage must
 // never block the LINE receive loop. If the worker returns reply_text, Go sends
