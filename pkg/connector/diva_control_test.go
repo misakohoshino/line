@@ -30,6 +30,8 @@ const (
 	divaTestAmin    = "uamin000000000000000000000000000a"
 	divaTestChen    = "uchen000000000000000000000000000c"
 	divaTestProdMID = "U8ae764e8e69e6bd4ecdd9b6ea0c40fce"
+	// divaTestRealMID is a real Production sender MID: it contains '_' and '-'.
+	divaTestRealMID = "UiW5ArR_TzJOkCyAfinglLAO5NXtg-KXLmCkPWuwqv9s"
 	divaTestGroupB  = "cgroupb00000000000000000000000000"
 )
 
@@ -266,11 +268,14 @@ func TestDIVAControlTargetsGroupsAndRoomsOnly(t *testing.T) {
 	if !strings.Contains(got.Error.Detail, "direct user targets are not allowed") {
 		t.Fatalf("detail = %q", got.Error.Detail)
 	}
-	// Accepting uppercase U for mentions must not open uppercase direct targets.
-	status, got = h.post(t, divaTextBody(newDIVARequestID(), divaTestProdMID, "hi"))
-	requireDIVAError(t, status, got, http.StatusBadRequest, outboundInvalidRequest, deliveryNotSent)
-	if !strings.Contains(got.Error.Detail, "direct user targets are not allowed") {
-		t.Fatalf("uppercase direct detail = %q", got.Error.Detail)
+	// Accepting uppercase U, '_' and '-' for mentions must not open direct
+	// targets, including the real Production MID shape.
+	for _, peer := range []string{divaTestProdMID, divaTestRealMID} {
+		status, got = h.post(t, divaTextBody(newDIVARequestID(), peer, "hi"))
+		requireDIVAError(t, status, got, http.StatusBadRequest, outboundInvalidRequest, deliveryNotSent)
+		if !strings.Contains(got.Error.Detail, "direct user targets are not allowed") {
+			t.Fatalf("direct %q detail = %q", peer, got.Error.Detail)
+		}
 	}
 	if n := len(h.env.fake.snapshot()); n != 0 {
 		t.Fatalf("LINE calls after direct target = %d", n)
@@ -335,6 +340,12 @@ func TestDIVAControlMentions(t *testing.T) {
 			want:     `{"MENTIONEES":[{"S":"0","E":"3","M":"` + divaTestProdMID + `"}]}`,
 		},
 		{
+			name:     "real Production MID with '_' and '-' is kept as-is",
+			text:     "@阿明 你好",
+			mentions: []map[string]any{{"mid": divaTestRealMID, "name": "阿明"}},
+			want:     `{"MENTIONEES":[{"S":"0","E":"3","M":"` + divaTestRealMID + `"}]}`,
+		},
+		{
 			name:       "mention_all",
 			text:       "@All 集合 @阿明",
 			mentions:   []map[string]any{{"mid": divaTestAmin, "name": "阿明"}},
@@ -354,6 +365,27 @@ func TestDIVAControlMentions(t *testing.T) {
 				t.Fatalf("MENTION = %s\nwant      %s", msg.ContentMetadata["MENTION"], tc.want)
 			}
 		})
+	}
+}
+
+// Allowing '_' and '-' in mention MIDs must not let anything but a user MID
+// through, even when the name is in the text.
+func TestDIVAControlMentionMIDStillValidated(t *testing.T) {
+	h := newDIVAControlHarness(t, divaControlConfig{})
+	for _, mid := range []string{
+		"", "U", sendTestGroup, "Cgroup_0000-0000", "rroom_0000", "xUiW5ArR_Tz",
+		"U iW5ArR", "UiW5ArR.Tz", "UiW5ArR/Tz", "UiW5ArR@Tz", "UiW5ArR_Tz\n",
+	} {
+		body := divaTextBody(newDIVARequestID(), sendTestGroup, "@阿明 你好")
+		body["relations"] = map[string]any{"mentions": []map[string]any{{"mid": mid, "name": "阿明"}}}
+		status, got := h.post(t, body)
+		requireDIVAError(t, status, got, 400, outboundInvalidRequest, deliveryNotSent)
+		if !strings.Contains(got.Error.Detail, "must be a LINE user MID") {
+			t.Fatalf("mid %q detail = %q", mid, got.Error.Detail)
+		}
+	}
+	if n := len(h.env.fake.snapshot()); n != 0 {
+		t.Fatalf("LINE calls after rejected mentions = %d", n)
 	}
 }
 

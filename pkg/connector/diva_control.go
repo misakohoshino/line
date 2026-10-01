@@ -67,11 +67,16 @@ var (
 	// business boundary here: group/room (c/C/r/R) allowed, direct user
 	// targets (u/U) refused. The shared send core remains the format authority.
 	divaChatMIDPattern = regexp.MustCompile(`^[cCrR][0-9A-Za-z]+$`)
-	// divaUserMIDPattern accepts LINE user MIDs (mentions, account_mid) as
+	// divaUserMIDPattern accepts LINE user MIDs (target.account_mid) as
 	// opaque identifiers too: Production sender MIDs from msg.From begin with
 	// uppercase U. The MID is passed through unchanged, never lowercased.
-	divaUserMIDPattern   = regexp.MustCompile(`^[uU][0-9A-Za-z]+$`)
-	divaMessageIDPattern = regexp.MustCompile(`^[0-9]{1,32}$`)
+	divaUserMIDPattern = regexp.MustCompile(`^[uU][0-9A-Za-z]+$`)
+	// divaMentionMIDPattern is for relations.mentions[].mid only. Production
+	// sender MIDs copied from msg.From also contain '_' and '-' (for example
+	// UiW5ArR_TzJOkCyAfinglLAO5NXtg-KXLmCkPWuwqv9s). Still user (u/U) MIDs
+	// only, passed through unchanged.
+	divaMentionMIDPattern = regexp.MustCompile(`^[uU][0-9A-Za-z_-]+$`)
+	divaMessageIDPattern  = regexp.MustCompile(`^[0-9]{1,32}$`)
 )
 
 // ---------------------------------------------------------------------------
@@ -285,7 +290,7 @@ func buildDIVAMentionMetadata(text string, mentions []divaSendMention, mentionAl
 
 	for _, i := range order {
 		m := mentions[i]
-		if !divaUserMIDPattern.MatchString(m.MID) {
+		if !divaMentionMIDPattern.MatchString(m.MID) {
 			return nil, fmt.Errorf("relations.mentions[%d].mid must be a LINE user MID", i)
 		}
 		if strings.TrimSpace(m.Name) == "" {
