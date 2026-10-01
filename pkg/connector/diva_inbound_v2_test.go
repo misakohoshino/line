@@ -368,3 +368,142 @@ func TestHandleDIVAInboundV2ForwardsBackfillWithoutReplying(t *testing.T) {
 		t.Fatalf("log leaked message text: %s", logs.String())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// sender display name for uncached senders (LINE-1B)
+// ---------------------------------------------------------------------------
+
+// startDIVAQuietWorker records v2 events and never asks for a reply.
+func startDIVAQuietWorker(t *testing.T) <-chan map[string]any {
+	t.Helper()
+	received := make(chan map[string]any, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var event map[string]any
+		_ = json.Unmarshal(body, &event)
+		received <- event
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("DIVA_WEBHOOK_URL", srv.URL+"/line/inbound")
+	t.Setenv("DIVA_CONTRACT_VERSION", "2")
+	return received
+}
+
+func divaGroupText(id, from string) *line.Message {
+	return &line.Message{ID: id, From: from, To: sendTestGroup, ToType: int(ToGroup), ContentType: int(ContentText)}
+}
+
+// receiveDIVASender waits for one forwarded event and returns its sender.
+func receiveDIVASender(t *testing.T, received <-chan map[string]any) map[string]any {
+	t.Helper()
+	select {
+	case event := <-received:
+		sender, _ := event["sender"].(map[string]any)
+		if _, ok := sender["display_name"]; !ok {
+			t.Fatalf("sender.display_name must always be present: %v", event)
+		}
+		return sender
+	case <-time.After(3 * time.Second):
+		t.Fatal("v2 event was not forwarded")
+	}
+	return nil
+}
+
+func countLineCalls(f *fakeLine, method string) int {
+	n := 0
+	for _, m := range f.methods() {
+		if m == method {
+			n++
+		}
+	}
+	return n
+}
+
+func TestDIVAV2LooksUpUncachedSenderNameOnce(t *testing.T) {
+	env := newSendTestEnv(t, false)
+	env.fake.contacts = map[string]string{divaTestProdMID: "阿明"}
+	received := startDIVAQuietWorker(t)
+
+	env.lc.handleDIVAInbound(divaGroupText("600000000000000101", divaTestProdMID), sendTestGroup, "哈囉你好", false, int(OpReceiveMessage), divaOriginLive)
+	sender := receiveDIVASender(t, received)
+	if sender["display_name"] != "阿明" || sender["mid"] != divaTestProdMID {
+		t.Fatalf("first message sender = %v", sender)
+	}
+
+	env.lc.handleDIVAInbound(divaGroupText("600000000000000102", divaTestProdMID), sendTestGroup, "哈囉你好", false, int(OpReceiveMessage), divaOriginLive)
+	if sender := receiveDIVASender(t, received); sender["display_name"] != "阿明" {
+		t.Fatalf("second message sender = %v", sender)
+	}
+	if n := countLineCalls(env.fake, "getContactsV2"); n != 1 {
+		t.Fatalf("getContactsV2 calls = %d, want 1 (second message must use the cache)", n)
+	}
+}
+
+func TestDIVAV2UnknownSenderNameStaysNull(t *testing.T) {
+	env := newSendTestEnv(t, false)
+	received := startDIVAQuietWorker(t)
+
+	// LINE has no contact for this MID; getContact falls back to the MID
+	// itself, which must never be sent as a name.
+	env.lc.handleDIVAInbound(divaGroupText("600000000000000103", divaTestProdMID), sendTestGroup, "哈囉你好", false, int(OpReceiveMessage), divaOriginLive)
+	if sender := receiveDIVASender(t, received); sender["display_name"] != nil {
+		t.Fatalf("unknown sender display_name = %v", sender["display_name"])
+	}
+}
+
+func TestDIVAV2SlowNameLookupTimesOutWithoutBlocking(t *testing.T) {
+	old := divaDisplayNameLookupTimeout
+	divaDisplayNameLookupTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { divaDisplayNameLookupTimeout = old })
+
+	env := newSendTestEnv(t, false)
+	env.fake.contacts = map[string]string{divaTestProdMID: "阿明"}
+	env.fake.contactDelay = 300 * time.Millisecond
+	received := startDIVAQuietWorker(t)
+
+	start := time.Now()
+	env.lc.handleDIVAInbound(divaGroupText("600000000000000104", divaTestProdMID), sendTestGroup, "哈囉你好", false, int(OpReceiveMessage), divaOriginLive)
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("handleDIVAInbound blocked the receive loop for %v", elapsed)
+	}
+	if sender := receiveDIVASender(t, received); sender["display_name"] != nil {
+		t.Fatalf("timed-out lookup display_name = %v", sender["display_name"])
+	}
+
+	// The lookup that outlived the timeout still fills the cache for the next message.
+	deadline := time.Now().Add(2 * time.Second)
+	for env.lc.cachedDisplayName(divaTestProdMID) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("late lookup did not fill the contact cache")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDIVAV2NoNameLookupForBackfillOrOwnMessages(t *testing.T) {
+	env := newSendTestEnv(t, false)
+	env.fake.contacts = map[string]string{divaTestProdMID: "阿明"}
+	received := startDIVAQuietWorker(t)
+
+	env.lc.handleDIVAInbound(divaGroupText("600000000000000105", divaTestProdMID), sendTestGroup, "哈囉你好", false, int(OpReceiveMessage), divaOriginBackfill)
+	receiveDIVASender(t, received)
+	env.lc.handleDIVAInbound(divaGroupText("600000000000000106", sendTestSelf), sendTestGroup, "789", false, int(OpSendMessage), divaOriginLive)
+	receiveDIVASender(t, received)
+
+	if n := countLineCalls(env.fake, "getContactsV2"); n != 0 {
+		t.Fatalf("getContactsV2 calls = %d, want 0", n)
+	}
+}
+
+func TestDIVADisplayNameRejectsMIDAndBlank(t *testing.T) {
+	for _, name := range []string{"", "  ", divaTestProdMID, strings.ToLower(divaTestProdMID)} {
+		if got := divaDisplayName(divaTestProdMID, name); got != nil {
+			t.Fatalf("divaDisplayName(%q) = %q, want nil", name, *got)
+		}
+	}
+	if got := divaDisplayName(divaTestProdMID, "阿明"); got == nil || *got != "阿明" {
+		t.Fatalf("divaDisplayName(阿明) = %v", got)
+	}
+}

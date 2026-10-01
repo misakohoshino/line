@@ -1,9 +1,11 @@
 package connector
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
@@ -184,7 +186,43 @@ func (lc *LineClient) cachedDisplayName(mid string) *string {
 	if !ok {
 		return nil
 	}
-	return divaStrPtr(cached.EffectiveDisplayName())
+	return divaDisplayName(mid, cached.EffectiveDisplayName())
+}
+
+// divaDisplayNameLookupTimeout bounds the single contact lookup made for a v2
+// live event whose sender is not in the contact cache yet.
+var divaDisplayNameLookupTimeout = time.Second
+
+// lookupDIVADisplayName fills a cold contact cache for one sender. The contact
+// cache is otherwise only filled by Matrix ghost handling, which runs after the
+// DIVA event has already been sent, so the first message from a sender would
+// always carry display_name null.
+//
+// It must only run off the LINE receive loop (in the DIVA forward goroutine).
+// getContact caches a successful lookup, so later messages are served from the
+// cache. A lookup still running at the timeout keeps going in the background
+// and may fill the cache for the next message; this event gets null.
+func (lc *LineClient) lookupDIVADisplayName(mid string) *string {
+	ctx, cancel := context.WithTimeout(context.Background(), divaDisplayNameLookupTimeout)
+	defer cancel()
+	found := make(chan line.Contact, 1)
+	go func() { found <- lc.getContact(ctx, mid) }()
+	select {
+	case contact := <-found:
+		return divaDisplayName(mid, contact.EffectiveDisplayName())
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// divaDisplayName returns name unless it is empty or just the MID, which is
+// what getContact falls back to when LINE has no profile for it.
+func divaDisplayName(mid, name string) *string {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.EqualFold(name, mid) {
+		return nil
+	}
+	return &name
 }
 
 func divaV2ContentFor(msg *line.Message, unwrappedText string, decryptionFailed bool) any {

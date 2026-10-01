@@ -26,10 +26,11 @@ import (
 )
 
 const (
-	divaTestToken  = "test-token-0123456789abcdefghijklmnopqrstuvwxyz"
-	divaTestAmin   = "uamin000000000000000000000000000a"
-	divaTestChen   = "uchen000000000000000000000000000c"
-	divaTestGroupB = "cgroupb00000000000000000000000000"
+	divaTestToken   = "test-token-0123456789abcdefghijklmnopqrstuvwxyz"
+	divaTestAmin    = "uamin000000000000000000000000000a"
+	divaTestChen    = "uchen000000000000000000000000000c"
+	divaTestProdMID = "U8ae764e8e69e6bd4ecdd9b6ea0c40fce"
+	divaTestGroupB  = "cgroupb00000000000000000000000000"
 )
 
 // ---------------------------------------------------------------------------
@@ -265,6 +266,12 @@ func TestDIVAControlTargetsGroupsAndRoomsOnly(t *testing.T) {
 	if !strings.Contains(got.Error.Detail, "direct user targets are not allowed") {
 		t.Fatalf("detail = %q", got.Error.Detail)
 	}
+	// Accepting uppercase U for mentions must not open uppercase direct targets.
+	status, got = h.post(t, divaTextBody(newDIVARequestID(), divaTestProdMID, "hi"))
+	requireDIVAError(t, status, got, http.StatusBadRequest, outboundInvalidRequest, deliveryNotSent)
+	if !strings.Contains(got.Error.Detail, "direct user targets are not allowed") {
+		t.Fatalf("uppercase direct detail = %q", got.Error.Detail)
+	}
 	if n := len(h.env.fake.snapshot()); n != 0 {
 		t.Fatalf("LINE calls after direct target = %d", n)
 	}
@@ -318,6 +325,14 @@ func TestDIVAControlMentions(t *testing.T) {
 			text:     "@阿明 @阿明哥",
 			mentions: []map[string]any{{"mid": divaTestAmin, "name": "阿明"}, {"mid": divaTestChen, "name": "阿明哥"}},
 			want:     `{"MENTIONEES":[{"S":"0","E":"3","M":"` + divaTestAmin + `"},{"S":"4","E":"8","M":"` + divaTestChen + `"}]}`,
+		},
+		{
+			// Production sender MIDs (msg.From) begin with uppercase U; the MID
+			// must be accepted and passed to LINE unchanged.
+			name:     "production uppercase U MID is kept as-is",
+			text:     "@阿明 你好",
+			mentions: []map[string]any{{"mid": divaTestProdMID, "name": "阿明"}},
+			want:     `{"MENTIONEES":[{"S":"0","E":"3","M":"` + divaTestProdMID + `"}]}`,
 		},
 		{
 			name:       "mention_all",

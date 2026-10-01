@@ -73,6 +73,10 @@ type fakeLine struct {
 	oids      int
 	mediaFlow map[string]int
 	sent      chan struct{}
+	// contacts answers getContactsV2 (mid -> display name); other mids are
+	// unknown. contactDelay slows getContactsV2 down; set it before use.
+	contacts     map[string]string
+	contactDelay time.Duration
 }
 
 func newFakeLine() *fakeLine {
@@ -105,6 +109,9 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 	var body []byte
 	if req.Body != nil {
 		body, _ = io.ReadAll(req.Body)
+	}
+	if f.contactDelay > 0 && strings.HasSuffix(req.URL.Path, "/getContactsV2") {
+		time.Sleep(f.contactDelay)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -146,6 +153,19 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 		case f.sent <- struct{}{}:
 		default:
 		}
+		return fakeHTTPResponse(req, 200, string(data), nil), nil
+	case "getContactsV2":
+		var query line.GetContactsV2Request
+		if len(args) > 0 {
+			_ = json.Unmarshal(args[0], &query)
+		}
+		contacts := map[string]any{}
+		for _, mid := range query.TargetUserMids {
+			if name, ok := f.contacts[mid]; ok {
+				contacts[mid] = map[string]any{"contact": map[string]any{"mid": mid, "displayName": name}}
+			}
+		}
+		data, _ := json.Marshal(map[string]any{"code": 0, "message": "", "data": map[string]any{"contacts": contacts}})
 		return fakeHTTPResponse(req, 200, string(data), nil), nil
 	case "acquireEncryptedAccessToken":
 		return fakeHTTPResponse(req, 200, `{"code":0,"message":"","data":"3600\u001eobs-token"}`, nil), nil

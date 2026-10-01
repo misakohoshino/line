@@ -132,37 +132,55 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 		return
 	}
 
-	var payload []byte
-	var err error
+	// The event is built here, while msg is still owned by the receive loop.
+	// Only the sender name lookup and the encoding run in the forward goroutine.
+	var encode func() ([]byte, error)
 	if version == divaContractV2 {
-		payload, err = json.Marshal(lc.buildDIVAV2Event(msg, chatMID, unwrappedText, decryptionFailed, opType, origin))
+		event := lc.buildDIVAV2Event(msg, chatMID, unwrappedText, decryptionFailed, opType, origin)
+		lookupName := event.Sender.DisplayName == nil && origin == divaOriginLive && !event.Sender.IsFromMe
+		encode = func() ([]byte, error) {
+			if lookupName {
+				event.Sender.DisplayName = lc.lookupDIVADisplayName(event.Sender.Mid)
+				lc.UserLogin.Bridge.Log.Debug().
+					Str("diva_event", "DIVA_NAME").
+					Str("sender_id", event.Sender.Mid).
+					Str("message_id", event.Message.ID).
+					Bool("found", event.Sender.DisplayName != nil).
+					Msg("[DIVA_NAME] display name lookup for uncached sender")
+			}
+			return json.Marshal(event)
+		}
 	} else {
-		payload, err = json.Marshal(divaInboundEvent{
+		event := divaInboundEvent{
 			Text:      unwrappedText,
 			GroupID:   chatMID,
 			SenderID:  msg.From,
 			MessageID: msg.ID,
-		})
+		}
+		encode = func() ([]byte, error) { return json.Marshal(event) }
 	}
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("message_id", msg.ID).Msg("DIVA adapter failed to encode inbound event")
-		return
-	}
-	lc.forwardDIVAInbound(payload, chatMID, msg.ID, origin == divaOriginLive)
+	lc.forwardDIVAInbound(encode, chatMID, msg.ID, origin == divaOriginLive)
 }
 
-// forwardDIVAInbound posts an encoded inbound event to the local DIVA worker.
-// It is intentionally asynchronous: a DIVA worker outage must never block the
-// LINE receive loop. If the worker returns reply_text and allowReply is set,
-// Go sends that text back to the same LINE chat. Backfilled events never get a
-// reply, whatever the worker answers.
-func (lc *LineClient) forwardDIVAInbound(payload []byte, groupID, messageID string, allowReply bool) {
+// forwardDIVAInbound encodes an inbound event and posts it to the local DIVA
+// worker. It is intentionally asynchronous: a DIVA worker outage or a slow
+// sender name lookup must never block the LINE receive loop. If the worker
+// returns reply_text and allowReply is set, Go sends that text back to the
+// same LINE chat. Backfilled events never get a reply, whatever the worker
+// answers.
+func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), groupID, messageID string, allowReply bool) {
 	endpoint := strings.TrimSpace(os.Getenv("DIVA_WEBHOOK_URL"))
 	if endpoint == "" {
 		return
 	}
 
 	go func() {
+		payload, err := encode()
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("message_id", messageID).Msg("DIVA adapter failed to encode inbound event")
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), defaultDIVAWebhookTimeout)
 		defer cancel()
 
