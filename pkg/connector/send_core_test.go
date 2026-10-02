@@ -72,7 +72,11 @@ type fakeLine struct {
 	sends     int
 	oids      int
 	mediaFlow map[string]int
-	sent      chan struct{}
+	// mediaFlowStatus, when set, makes determineMediaMessageFlow fail with
+	// this HTTP status and mediaFlowBody (Production has seen 500/99999).
+	mediaFlowStatus int
+	mediaFlowBody   string
+	sent            chan struct{}
 	// contacts answers getContactsV2 (mid -> display name); other mids are
 	// unknown. contactDelay slows getContactsV2 down; set it before use.
 	contacts     map[string]string
@@ -170,6 +174,9 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 	case "acquireEncryptedAccessToken":
 		return fakeHTTPResponse(req, 200, `{"code":0,"message":"","data":"3600\u001eobs-token"}`, nil), nil
 	case "determineMediaMessageFlow":
+		if f.mediaFlowStatus != 0 {
+			return fakeHTTPResponse(req, f.mediaFlowStatus, f.mediaFlowBody, nil), nil
+		}
 		data, _ := json.Marshal(map[string]any{
 			"code": 0, "message": "",
 			"data": map[string]any{"flowMap": f.mediaFlow, "cacheTtlMillis": "60000"},

@@ -133,6 +133,9 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int, origin
 	senderID := makeUserID(msg.From)
 	bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, portalIDStr, opType)
 
+	// A plain image LINE actually delivered here tells us this chat's media flow.
+	lc.observeInboundMediaFlow(msg, portalIDStr, origin)
+
 	// DIVA adapter: hand group/room messages to the DIVA worker before Matrix
 	// portal handling, so Matrix room errors cannot hide the event.
 	lc.handleDIVAInbound(msg, portalIDStr, unwrappedText, decryptionFailed, opType, origin)

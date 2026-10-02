@@ -141,6 +141,13 @@ type imageDownloadSource struct {
 	isPlainMedia bool
 }
 
+// IsPlainImageMedia reports whether ConvertImage downloads this image through
+// the plain media path (r/talk/m/{messageID}), the same decision it logs as
+// plain_media=true. It only looks at message metadata.
+func IsPlainImageMedia(data line.Message) bool {
+	return lineImageDownloadSource(data).isPlainMedia
+}
+
 func lineImageDownloadSource(data line.Message) imageDownloadSource {
 	if publicPath := data.ContentMetadata["DOWNLOAD_URL"]; publicPath != "" {
 		return imageDownloadSource{publicPath: publicPath}
