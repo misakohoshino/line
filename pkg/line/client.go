@@ -28,6 +28,7 @@ const (
 	ExtensionVersion      = "3.7.2"
 	UserAgent             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 	rpcClientTimeout      = 30 * time.Second
+	obsClientTimeout      = 5 * time.Minute
 	obsMaxRetries         = 5
 	lineApplicationHeader = "CHROMEOS\t" + ExtensionVersion + "\tChrome_OS\t"
 	albumPreviewChannelID = "1341209850"
@@ -64,7 +65,7 @@ type cachedChannelAccessToken struct {
 func NewClient(token string) *Client {
 	return &Client{
 		HTTPClient:  &http.Client{Timeout: rpcClientTimeout},
-		OBSClient:   &http.Client{},
+		OBSClient:   &http.Client{Timeout: obsClientTimeout},
 		AccessToken: token,
 	}
 }
@@ -76,7 +77,7 @@ func (c *Client) obsHTTPClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return &http.Client{}
+	return &http.Client{Timeout: obsClientTimeout}
 }
 
 func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
