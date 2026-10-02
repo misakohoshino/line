@@ -44,19 +44,20 @@ import (
 )
 
 const (
-	divaControlDefaultListen  = ":8090"
-	divaControlMinTokenLength = 32
+	divaControlDefaultListen         = ":8090"
+	divaControlMinTokenLength        = 32
 	divaControlMaxBodyBytes          = 1 << 20
 	divaControlDefaultMediaMaxBytes  = 32 << 20
 	divaControlMediaMaxConcurrent    = 2
+	divaControlMediaMaxPending       = 4
 	divaControlMediaReadTimeout      = 2 * time.Minute
 	divaControlMaxConcurrent         = 4
-	divaControlMaxPending     = 64
-	divaControlMaxEntries     = 10000
-	divaControlResultTTL      = 10 * time.Minute
-	divaControlDefaultWait    = 15 * time.Second
-	divaControlMinWait        = 100 * time.Millisecond
-	divaControlMaxWait        = 30 * time.Second
+	divaControlMaxPending            = 64
+	divaControlMaxEntries            = 10000
+	divaControlResultTTL             = 10 * time.Minute
+	divaControlDefaultWait           = 15 * time.Second
+	divaControlMinWait               = 100 * time.Millisecond
+	divaControlMaxWait               = 30 * time.Second
 	// divaControlSendBudget bounds one background send. The core may make
 	// several LINE calls (retries), each limited by the 30 s HTTP client.
 	divaControlSendBudget = 3 * time.Minute
@@ -555,8 +556,9 @@ type divaControlServer struct {
 	requests map[string]*divaRequestEntry
 	// lanes holds, per account/chat, the done channel of the last queued
 	// send. A lane is removed when its last send finishes.
-	lanes   map[string]chan struct{}
-	pending int
+	lanes        map[string]chan struct{}
+	pending      int
+	mediaPending int
 
 	wg         sync.WaitGroup
 	httpServer *http.Server
@@ -824,6 +826,10 @@ func (s *divaControlServer) handleSendMedia(w http.ResponseWriter, r *http.Reque
 		writeDIVAError(w, reqErr.status, raw.RequestID, reqErr.code, reqErr.detail)
 		return
 	}
+	// The server-level WriteTimeout starts when headers were read, so a slow
+	// media upload could consume most of it before the send result is written.
+	// Reset it here so the response budget follows this request's wait budget.
+	_ = rc.SetWriteDeadline(time.Now().Add(job.wait + 10*time.Second))
 	result, status := s.submit(r.Context(), job)
 	writeDIVAJSON(w, status, result)
 }
@@ -866,6 +872,10 @@ func (s *divaControlServer) submit(reqCtx context.Context, job *divaSendJob) (ou
 		s.mu.Unlock()
 		return divaErrorResult(job.requestID, outboundInternal, true, "too many pending DIVA sends; nothing was sent"), http.StatusServiceUnavailable
 	}
+	if job.req.Media != nil && s.mediaPending >= divaControlMediaMaxPending {
+		s.mu.Unlock()
+		return divaErrorResult(job.requestID, outboundInternal, true, "too many pending DIVA media sends; nothing was sent"), http.StatusServiceUnavailable
+	}
 	entry := &divaRequestEntry{fingerprint: job.fingerprint, done: make(chan struct{})}
 	s.requests[job.requestID] = entry
 	laneKey := lc.midOrFallback() + "/" + job.chatID
@@ -873,6 +883,9 @@ func (s *divaControlServer) submit(reqCtx context.Context, job *divaSendJob) (ou
 	mine := make(chan struct{})
 	s.lanes[laneKey] = mine
 	s.pending++
+	if job.req.Media != nil {
+		s.mediaPending++
+	}
 	s.wg.Add(1)
 	s.mu.Unlock()
 
@@ -904,6 +917,9 @@ func (s *divaControlServer) run(job *divaSendJob, entry *divaRequestEntry, lc *L
 			delete(s.lanes, laneKey)
 		}
 		s.pending--
+		if job.req.Media != nil {
+			s.mediaPending--
+		}
 		s.mu.Unlock()
 		s.wg.Done()
 	}()
