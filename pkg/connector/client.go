@@ -15,6 +15,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/connector/handlers"
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
@@ -93,6 +94,10 @@ type cachedMediaFlow struct {
 	flowMap  map[string]int
 	cachedAt time.Time
 	ttl      time.Duration
+	// learnedOnly marks an entry created from an inbound message instead of a
+	// determineMediaMessageFlow answer. It only knows the content types it has
+	// seen, so a send of any other type still asks the server.
+	learnedOnly bool
 }
 
 type peerKeyInfo struct {
@@ -223,12 +228,17 @@ func (lc *LineClient) shouldUseE2EEMediaFlow(chatMid string, contentType int) bo
 		lc.mediaFlowCache = make(map[string]cachedMediaFlow)
 	}
 	if cached, ok := lc.mediaFlowCache[chatMid]; ok && time.Since(cached.cachedAt) < cached.ttl {
-		lc.cacheMu.Unlock()
+		// Read the map under the lock: observeInboundMediaFlow may replace it.
 		flow, exists := cached.flowMap[strconv.Itoa(contentType)]
 		if exists {
+			lc.cacheMu.Unlock()
 			return flow == 2
 		}
-		return true
+		if !cached.learnedOnly {
+			lc.cacheMu.Unlock()
+			return true
+		}
+		// A learned entry does not know this content type: ask the server.
 	}
 	lc.cacheMu.Unlock()
 
@@ -261,6 +271,78 @@ func (lc *LineClient) shouldUseE2EEMediaFlow(chatMid string, contentType int) bo
 		return flow == 2
 	}
 	return true
+}
+
+// observeInboundMediaFlow learns a chat's media flow from an inbound live
+// message. determineMediaMessageFlow can fail for a chat (LINE has answered
+// 500/99999), and shouldUseE2EEMediaFlow then falls back to the E2EE upload.
+// A plain image that LINE actually delivered in the chat is direct evidence
+// that the chat uses the plain media flow (flow 1) for images.
+//
+// Only plain images are learned, using the same rule ConvertImage uses for
+// plain_media=true. E2EE media is never learned as plain. A learned value
+// overrides the cached value for that content type, keeps the timing of a
+// still-valid server entry, and is replaced by the next successful
+// determineMediaMessageFlow answer.
+func (lc *LineClient) observeInboundMediaFlow(msg *line.Message, chatMid string, origin divaOrigin) {
+	// Backfilled messages can be old and say nothing about the current flow.
+	if msg == nil || chatMid == "" || origin != divaOriginLive {
+		return
+	}
+	if ContentType(msg.ContentType) != ContentImage || len(msg.Chunks) > 0 ||
+		msg.ContentMetadata["ORGCONTP"] != "" || msg.ContentMetadata["ENC_KM"] != "" ||
+		!handlers.IsPlainImageMedia(*msg) {
+		return
+	}
+	key := strconv.Itoa(int(ContentImage))
+	const plainFlow = 1
+
+	lc.cacheMu.Lock()
+	if lc.mediaFlowCache == nil {
+		lc.mediaFlowCache = make(map[string]cachedMediaFlow)
+	}
+	previous, hadPrevious := lc.mediaFlowCache[chatMid]
+	valid := hadPrevious && time.Since(previous.cachedAt) < previous.ttl
+	previousFlow, hadFlow := previous.flowMap[key]
+	if valid && hadFlow && previousFlow == plainFlow {
+		lc.cacheMu.Unlock()
+		return
+	}
+	entry := cachedMediaFlow{
+		flowMap:     map[string]int{key: plainFlow},
+		cachedAt:    time.Now(),
+		ttl:         defaultMediaFlowTTL,
+		learnedOnly: true,
+	}
+	if valid {
+		// Copy, never mutate: the server map may still be read elsewhere.
+		for k, v := range previous.flowMap {
+			if k != key {
+				entry.flowMap[k] = v
+			}
+		}
+		entry.flowMap[key] = plainFlow
+		if !previous.learnedOnly {
+			// Keep the server entry's timing so the server is asked again on
+			// its own schedule.
+			entry.cachedAt = previous.cachedAt
+			entry.ttl = previous.ttl
+			entry.learnedOnly = false
+		}
+	}
+	lc.mediaFlowCache[chatMid] = entry
+	lc.cacheMu.Unlock()
+
+	evt := lc.UserLogin.Bridge.Log.Info().
+		Str("chat_mid", chatMid).
+		Str("msg_id", msg.ID).
+		Int("content_type", int(ContentImage)).
+		Int("flow", plainFlow).
+		Bool("replaced_valid_entry", valid)
+	if valid && hadFlow {
+		evt = evt.Int("previous_flow", previousFlow)
+	}
+	evt.Msg("Learned plain media flow from inbound image")
 }
 
 func (lc *LineClient) isUserBlocked(mid string) bool {
