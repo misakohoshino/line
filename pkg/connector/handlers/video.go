@@ -20,7 +20,6 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
 
@@ -50,15 +49,15 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		sid = "m"
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
-	dlStart := time.Now()
-	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-
-	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-		client = newClient
-		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-	}
-	h.handleFinalAuthError(ctx, client, err)
+	fetched, err := h.fetchMedia(ctx, mediaFetchRequest{
+		MessageID: data.ID,
+		OID:       oid,
+		SID:       sid,
+		UseSID:    true,
+		Plain:     isPlainMedia,
+		Options:   downloadOptions,
+	})
+	videoData := fetched.Data
 
 	if err != nil {
 		h.Log.Warn().
@@ -66,7 +65,7 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 			Str("oid", oid).
 			Str("msg_id", data.ID).
 			Bool("plain_media", isPlainMedia).
-			Dur("download_duration", time.Since(dlStart)).
+			Dur("download_duration", time.Since(fetched.StartedAt)).
 			Msg("Failed to download video from OBS")
 		return mediaDownloadFailure("Video", err, relatesTo)
 	}
@@ -111,7 +110,7 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		Str("mxc", mxc.ParseOrIgnore().String()).
 		Str("file_name", fileName).
 		Int("size", len(videoData)).
-		Dur("download_duration", time.Since(dlStart)).
+		Dur("download_duration", time.Since(fetched.StartedAt)).
 		Msg("Successfully uploaded video to Matrix")
 
 	var duration int
