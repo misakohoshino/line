@@ -2,11 +2,16 @@ package connector
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"testing"
+	"time"
+
+	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
 func divaImageMetadata(requestID, chatID string) map[string]any {
@@ -176,6 +181,45 @@ func TestDIVAControlMediaDefaults(t *testing.T) {
 	if cap(h.s.mediaSem) != divaControlMediaMaxConcurrent {
 		t.Fatalf("media concurrency = %d", cap(h.s.mediaSem))
 	}
+	if h.s.mediaPending != 0 {
+		t.Fatalf("media pending = %d", h.s.mediaPending)
+	}
+}
+
+func TestDIVAControlRejectsTooManyPendingMediaSends(t *testing.T) {
+	started := make(chan struct{}, divaControlMediaMaxPending)
+	release := make(chan struct{})
+	h := newDIVAControlHarness(t, divaControlConfig{
+		maxConcurrent:      divaControlMediaMaxPending,
+		mediaMaxConcurrent: divaControlMediaMaxPending,
+		send: func(ctx context.Context, lc *LineClient, req *lineOutboundRequest) (*lineOutboundResult, error) {
+			started <- struct{}{}
+			select {
+			case <-release:
+				return &lineOutboundResult{Sent: &line.Message{ID: "srv-media", To: req.ChatMID}, SentAt: time.Now()}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	})
+	defer close(release)
+
+	data := testPNG(t)
+	for i := 0; i < divaControlMediaMaxPending; i++ {
+		meta := divaImageMetadata(newDIVARequestID(), fmt.Sprintf("cmedia%030d", i))
+		go h.postMedia(t, divaTestToken, meta, data)
+	}
+	for i := 0; i < divaControlMediaMaxPending; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("media send did not start")
+		}
+	}
+
+	status, got := h.postMedia(t, divaTestToken,
+		divaImageMetadata(newDIVARequestID(), "coverflow000000000000000000000000000"), data)
+	requireDIVAError(t, status, got, http.StatusServiceUnavailable, outboundInternal, deliveryNotSent)
 }
 
 func TestDIVAControlSendMediaRejectsWrongMethod(t *testing.T) {
