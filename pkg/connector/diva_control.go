@@ -44,16 +44,20 @@ import (
 )
 
 const (
-	divaControlDefaultListen  = ":8090"
-	divaControlMinTokenLength = 32
-	divaControlMaxBodyBytes   = 1 << 20
-	divaControlMaxConcurrent  = 4
-	divaControlMaxPending     = 64
-	divaControlMaxEntries     = 10000
-	divaControlResultTTL      = 10 * time.Minute
-	divaControlDefaultWait    = 15 * time.Second
-	divaControlMinWait        = 100 * time.Millisecond
-	divaControlMaxWait        = 30 * time.Second
+	divaControlDefaultListen        = ":8090"
+	divaControlMinTokenLength       = 32
+	divaControlMaxBodyBytes         = 1 << 20
+	divaControlDefaultMediaMaxBytes = 32 << 20
+	divaControlMediaMaxConcurrent   = 2
+	divaControlMediaMaxPending      = 4
+	divaControlMediaReadTimeout     = 2 * time.Minute
+	divaControlMaxConcurrent        = 4
+	divaControlMaxPending           = 64
+	divaControlMaxEntries           = 10000
+	divaControlResultTTL            = 10 * time.Minute
+	divaControlDefaultWait          = 15 * time.Second
+	divaControlMinWait              = 100 * time.Millisecond
+	divaControlMaxWait              = 30 * time.Second
 	// divaControlSendBudget bounds one background send. The core may make
 	// several LINE calls (retries), each limited by the 30 s HTTP client.
 	divaControlSendBudget = 3 * time.Minute
@@ -114,10 +118,35 @@ type divaTextContent struct {
 	Text string `json:"text"`
 }
 
+// divaSendMediaMetadata is the strict JSON metadata part of /diva/v1/send-media.
+// The binary media bytes travel in a separate multipart part and are never
+// base64-encoded into the existing text JSON contract.
+type divaSendMediaMetadata struct {
+	Version   *int   `json:"version"`
+	RequestID string `json:"request_id"`
+	Target    struct {
+		ChatID     string  `json:"chat_id"`
+		AccountMID *string `json:"account_mid"`
+	} `json:"target"`
+	MessageType string `json:"message_type"`
+	FileName    string `json:"file_name,omitempty"`
+	MimeType    string `json:"mime_type,omitempty"`
+	Relations   *struct {
+		ReplyTo *struct {
+			MessageID string `json:"message_id"`
+		} `json:"reply_to"`
+	} `json:"relations,omitempty"`
+	Options *struct {
+		ReplyFallback string `json:"reply_fallback"`
+		TimeoutMS     *int   `json:"timeout_ms"`
+	} `json:"options,omitempty"`
+}
+
 const (
 	divaReplyFallbackFail   = "fail"
 	divaReplyFallbackDrop   = "send_without_reply"
 	divaMessageTypeText     = "text"
+	divaMessageTypeImage    = "image"
 	divaSendContractVersion = 1
 )
 
@@ -247,6 +276,100 @@ func parseDIVASendRequest(body []byte) (*divaSendRequest, *divaSendJob, *divaReq
 	}{accountMID, raw.Target.ChatID, raw.MessageType, content.Text, replyTo, replyFallback, mentions, mentionAll})
 	job.fingerprint = sha256.Sum256(fp)
 	return &raw, job, nil
+}
+
+// parseDIVASendMediaMetadata validates the metadata and image bytes and builds
+// the same send job used by /diva/v1/send. It never touches LINE.
+func parseDIVASendMediaMetadata(raw divaSendMediaMetadata, data []byte, multipartFileName string) (*divaSendJob, *divaRequestError) {
+	if raw.Version == nil || *raw.Version != divaSendContractVersion {
+		return nil, invalidRequest("unsupported version: only version %d is accepted", divaSendContractVersion)
+	}
+	if !divaUUIDPattern.MatchString(raw.RequestID) {
+		return nil, invalidRequest("request_id must be a UUID")
+	}
+	if !divaChatMIDPattern.MatchString(raw.Target.ChatID) {
+		return nil, invalidRequest("target.chat_id must be a LINE group/room chat ID beginning with c/C or r/R; direct user targets are not allowed")
+	}
+	accountMID := ""
+	if raw.Target.AccountMID != nil {
+		accountMID = *raw.Target.AccountMID
+		if !divaUserMIDPattern.MatchString(accountMID) {
+			return nil, invalidRequest("target.account_mid must be a LINE user MID or null")
+		}
+	}
+	if raw.MessageType != divaMessageTypeImage {
+		return nil, &divaRequestError{
+			status: http.StatusBadRequest,
+			code:   outboundUnsupportedMessageType,
+			detail: fmt.Sprintf("message_type %q is not supported by /diva/v1/send-media; only %q", raw.MessageType, divaMessageTypeImage),
+		}
+	}
+	if len(data) == 0 {
+		return nil, invalidRequest("media must not be empty")
+	}
+	detectedMIME := http.DetectContentType(data)
+	switch detectedMIME {
+	case "image/jpeg", "image/png", "image/gif":
+	default:
+		return nil, invalidRequest("media is not a supported image (JPEG, PNG or GIF)")
+	}
+	if raw.MimeType != "" && raw.MimeType != detectedMIME {
+		return nil, invalidRequest("mime_type %q does not match detected media type %q", raw.MimeType, detectedMIME)
+	}
+	mimeType := raw.MimeType
+	if mimeType == "" {
+		mimeType = detectedMIME
+	}
+	fileName := strings.TrimSpace(raw.FileName)
+	if fileName == "" {
+		fileName = strings.TrimSpace(multipartFileName)
+	}
+
+	replyTo := ""
+	if raw.Relations != nil && raw.Relations.ReplyTo != nil {
+		replyTo = raw.Relations.ReplyTo.MessageID
+		if !divaMessageIDPattern.MatchString(replyTo) {
+			return nil, invalidRequest("relations.reply_to.message_id must be a LINE message ID")
+		}
+	}
+	replyFallback := divaReplyFallbackFail
+	wait := divaControlDefaultWait
+	if raw.Options != nil {
+		switch raw.Options.ReplyFallback {
+		case "", divaReplyFallbackFail:
+		case divaReplyFallbackDrop:
+			replyFallback = divaReplyFallbackDrop
+		default:
+			return nil, invalidRequest("options.reply_fallback must be %q or %q", divaReplyFallbackFail, divaReplyFallbackDrop)
+		}
+		if raw.Options.TimeoutMS != nil {
+			wait = time.Duration(*raw.Options.TimeoutMS) * time.Millisecond
+			wait = max(divaControlMinWait, min(wait, divaControlMaxWait))
+		}
+	}
+
+	mediaHash := sha256.Sum256(data)
+	job := &divaSendJob{
+		requestID:  raw.RequestID,
+		accountMID: accountMID,
+		chatID:     raw.Target.ChatID,
+		wait:       wait,
+		req: &lineOutboundRequest{
+			ChatMID:       raw.Target.ChatID,
+			ContentType:   ContentImage,
+			Media:         &outboundMedia{Data: data, MimeType: mimeType, FileName: fileName},
+			ReplyToID:     replyTo,
+			ReplyFallback: replyFallback == divaReplyFallbackDrop,
+		},
+	}
+	fp, _ := json.Marshal(struct {
+		AccountMID, ChatID, MessageType, FileName, MimeType, ReplyTo, ReplyFallback string
+		MediaSHA256                                                                 [32]byte
+	}{
+		accountMID, raw.Target.ChatID, raw.MessageType, fileName, mimeType, replyTo, replyFallback, mediaHash,
+	})
+	job.fingerprint = sha256.Sum256(fp)
+	return job, nil
 }
 
 // buildDIVAMentionMetadata finds "@<name>" for every mention and "@All" for
@@ -401,13 +524,15 @@ func selectDIVALogin(logins []*bridgev2.UserLogin, accountMID string) (*LineClie
 type divaSendFunc func(ctx context.Context, lc *LineClient, req *lineOutboundRequest) (*lineOutboundResult, error)
 
 type divaControlConfig struct {
-	token         string
-	logins        func() []*bridgev2.UserLogin
-	send          divaSendFunc
-	log           zerolog.Logger
-	maxConcurrent int
-	maxPending    int
-	resultTTL     time.Duration
+	token              string
+	logins             func() []*bridgev2.UserLogin
+	send               divaSendFunc
+	log                zerolog.Logger
+	maxConcurrent      int
+	maxPending         int
+	resultTTL          time.Duration
+	mediaMaxBytes      int64
+	mediaMaxConcurrent int
 }
 
 // divaRequestEntry is one request_id: in flight until done is closed, then
@@ -425,13 +550,15 @@ type divaControlServer struct {
 	baseCtx   context.Context
 	cancel    context.CancelFunc
 	sem       chan struct{}
+	mediaSem  chan struct{}
 
 	mu       sync.Mutex
 	requests map[string]*divaRequestEntry
 	// lanes holds, per account/chat, the done channel of the last queued
 	// send. A lane is removed when its last send finishes.
-	lanes   map[string]chan struct{}
-	pending int
+	lanes        map[string]chan struct{}
+	pending      int
+	mediaPending int
 
 	wg         sync.WaitGroup
 	httpServer *http.Server
@@ -448,6 +575,12 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 	if cfg.resultTTL <= 0 {
 		cfg.resultTTL = divaControlResultTTL
 	}
+	if cfg.mediaMaxBytes <= 0 {
+		cfg.mediaMaxBytes = divaControlDefaultMediaMaxBytes
+	}
+	if cfg.mediaMaxConcurrent <= 0 {
+		cfg.mediaMaxConcurrent = divaControlMediaMaxConcurrent
+	}
 	if cfg.send == nil {
 		cfg.send = func(ctx context.Context, lc *LineClient, req *lineOutboundRequest) (*lineOutboundResult, error) {
 			return lc.sendLineOutbound(ctx, req)
@@ -460,6 +593,7 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 		baseCtx:   ctx,
 		cancel:    cancel,
 		sem:       make(chan struct{}, cfg.maxConcurrent),
+		mediaSem:  make(chan struct{}, cfg.mediaMaxConcurrent),
 		requests:  map[string]*divaRequestEntry{},
 		lanes:     map[string]chan struct{}{},
 	}
@@ -469,6 +603,7 @@ func (s *divaControlServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/diva/v1/health", s.handleHealth)
 	mux.HandleFunc("/diva/v1/send", s.handleSend)
+	mux.HandleFunc("/diva/v1/send-media", s.handleSendMedia)
 	return mux
 }
 
@@ -494,10 +629,20 @@ func startDIVAControl(br *bridgev2.Bridge) *divaControlServer {
 		log.Error().Err(err).Str("listen", addr).Msg("DIVA control endpoint disabled: cannot listen")
 		return nil
 	}
+	mediaMaxBytes := int64(divaControlDefaultMediaMaxBytes)
+	if raw := strings.TrimSpace(os.Getenv("DIVA_MEDIA_MAX_BYTES")); raw != "" {
+		if parsed, parseErr := strconv.ParseInt(raw, 10, 64); parseErr != nil || parsed <= 0 {
+			log.Warn().Str("value", raw).Int64("default_bytes", mediaMaxBytes).
+				Msg("Ignoring invalid DIVA_MEDIA_MAX_BYTES")
+		} else {
+			mediaMaxBytes = parsed
+		}
+	}
 	s := newDIVAControlServer(divaControlConfig{
-		token:  token,
-		logins: br.GetAllCachedUserLogins,
-		log:    log,
+		token:         token,
+		logins:        br.GetAllCachedUserLogins,
+		log:           log,
+		mediaMaxBytes: mediaMaxBytes,
 	})
 	s.addr = listener.Addr().String()
 	s.httpServer = &http.Server{
@@ -593,6 +738,102 @@ func (s *divaControlServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	writeDIVAJSON(w, status, result)
 }
 
+func (s *divaControlServer) handleSendMedia(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeDIVAError(w, http.StatusMethodNotAllowed, "", outboundInvalidRequest, "method not allowed")
+		return
+	}
+	if !s.authorized(r) {
+		writeDIVAError(w, http.StatusUnauthorized, "", outboundUnauthorized, "missing or invalid bearer token")
+		return
+	}
+
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(divaControlMediaReadTimeout))
+	defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
+
+	// Keep the original 1 MiB JSON allowance for metadata/Multipart overhead
+	// in addition to the configured binary media limit.
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.mediaMaxBytes+divaControlMaxBodyBytes)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeDIVAError(w, http.StatusBadRequest, "", outboundInvalidRequest, "content type must be multipart/form-data")
+		return
+	}
+
+	metaPart, err := mr.NextPart()
+	if err != nil || metaPart.FormName() != "metadata" {
+		writeDIVAError(w, http.StatusBadRequest, "", outboundInvalidRequest, "first multipart part must be metadata")
+		return
+	}
+	metaBytes, err := io.ReadAll(io.LimitReader(metaPart, divaControlMaxBodyBytes+1))
+	_ = metaPart.Close()
+	if err != nil || len(metaBytes) > divaControlMaxBodyBytes {
+		writeDIVAError(w, http.StatusBadRequest, "", outboundInvalidRequest, "metadata part is too large or unreadable")
+		return
+	}
+	var raw divaSendMediaMetadata
+	dec := json.NewDecoder(bytes.NewReader(metaBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		writeDIVAError(w, http.StatusBadRequest, "", outboundInvalidRequest, fmt.Sprintf("invalid metadata JSON: %v", err))
+		return
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		writeDIVAError(w, http.StatusBadRequest, raw.RequestID, outboundInvalidRequest, "invalid metadata JSON: trailing data")
+		return
+	}
+
+	mediaPart, err := mr.NextPart()
+	if err != nil || mediaPart.FormName() != "media" {
+		writeDIVAError(w, http.StatusBadRequest, raw.RequestID, outboundInvalidRequest, "second multipart part must be media")
+		return
+	}
+	multipartFileName := mediaPart.FileName()
+	data, err := io.ReadAll(io.LimitReader(mediaPart, s.cfg.mediaMaxBytes+1))
+	_ = mediaPart.Close()
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeDIVAError(w, http.StatusRequestEntityTooLarge, raw.RequestID, outboundInvalidRequest, "request body too large")
+			return
+		}
+		writeDIVAError(w, http.StatusBadRequest, raw.RequestID, outboundInvalidRequest, "cannot read media part")
+		return
+	}
+	if int64(len(data)) > s.cfg.mediaMaxBytes {
+		writeDIVAError(w, http.StatusRequestEntityTooLarge, raw.RequestID, outboundInvalidRequest, "media exceeds DIVA_MEDIA_MAX_BYTES")
+		return
+	}
+	if extra, nextErr := mr.NextPart(); nextErr == nil {
+		_ = extra.Close()
+		writeDIVAError(w, http.StatusBadRequest, raw.RequestID, outboundInvalidRequest, "unexpected extra multipart part")
+		return
+	} else if !errors.Is(nextErr, io.EOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(nextErr, &tooLarge) {
+			writeDIVAError(w, http.StatusRequestEntityTooLarge, raw.RequestID, outboundInvalidRequest, "request body too large")
+			return
+		}
+		writeDIVAError(w, http.StatusBadRequest, raw.RequestID, outboundInvalidRequest, "invalid multipart body")
+		return
+	}
+
+	job, reqErr := parseDIVASendMediaMetadata(raw, data, multipartFileName)
+	if reqErr != nil {
+		writeDIVAError(w, reqErr.status, raw.RequestID, reqErr.code, reqErr.detail)
+		return
+	}
+	// The server-level WriteTimeout starts when headers were read, so a slow
+	// media upload could consume most of it before the send result is written.
+	// Reset it here so the response budget follows this request's wait budget.
+	_ = rc.SetWriteDeadline(time.Now().Add(job.wait + 10*time.Second))
+	result, status := s.submit(r.Context(), job)
+	writeDIVAJSON(w, status, result)
+}
+
 // submit runs the dedupe / queue / wait logic for one validated request.
 func (s *divaControlServer) submit(reqCtx context.Context, job *divaSendJob) (outboundResult, int) {
 	s.mu.Lock()
@@ -631,6 +872,10 @@ func (s *divaControlServer) submit(reqCtx context.Context, job *divaSendJob) (ou
 		s.mu.Unlock()
 		return divaErrorResult(job.requestID, outboundInternal, true, "too many pending DIVA sends; nothing was sent"), http.StatusServiceUnavailable
 	}
+	if job.req.Media != nil && s.mediaPending >= divaControlMediaMaxPending {
+		s.mu.Unlock()
+		return divaErrorResult(job.requestID, outboundInternal, true, "too many pending DIVA media sends; nothing was sent"), http.StatusServiceUnavailable
+	}
 	entry := &divaRequestEntry{fingerprint: job.fingerprint, done: make(chan struct{})}
 	s.requests[job.requestID] = entry
 	laneKey := lc.midOrFallback() + "/" + job.chatID
@@ -638,6 +883,9 @@ func (s *divaControlServer) submit(reqCtx context.Context, job *divaSendJob) (ou
 	mine := make(chan struct{})
 	s.lanes[laneKey] = mine
 	s.pending++
+	if job.req.Media != nil {
+		s.mediaPending++
+	}
 	s.wg.Add(1)
 	s.mu.Unlock()
 
@@ -646,6 +894,7 @@ func (s *divaControlServer) submit(reqCtx context.Context, job *divaSendJob) (ou
 		Str("chat_id", job.chatID).
 		Bool("reply", job.req.ReplyToID != "").
 		Bool("mention", job.req.MentionMeta != nil).
+		Bool("media", job.req.Media != nil).
 		Msg("DIVA send accepted")
 	go s.run(job, entry, lc, laneKey, prev, mine)
 	return s.wait(reqCtx, job, entry, false), http.StatusOK
@@ -668,6 +917,9 @@ func (s *divaControlServer) run(job *divaSendJob, entry *divaRequestEntry, lc *L
 			delete(s.lanes, laneKey)
 		}
 		s.pending--
+		if job.req.Media != nil {
+			s.mediaPending--
+		}
 		s.mu.Unlock()
 		s.wg.Done()
 	}()
@@ -682,6 +934,15 @@ func (s *divaControlServer) run(job *divaSendJob, entry *divaRequestEntry, lc *L
 			result = notStarted()
 			return
 		}
+	}
+	if job.req.Media != nil {
+		select {
+		case s.mediaSem <- struct{}{}:
+		case <-s.baseCtx.Done():
+			result = notStarted()
+			return
+		}
+		defer func() { <-s.mediaSem }()
 	}
 	select {
 	case s.sem <- struct{}{}:
