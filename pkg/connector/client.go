@@ -223,30 +223,67 @@ func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar
 // for the given chat and content type. Returns true for E2EE, false for plain.
 // Falls back to true (E2EE) if the server call fails, to preserve existing behavior.
 func (lc *LineClient) shouldUseE2EEMediaFlow(chatMid string, contentType int) bool {
+	key := strconv.Itoa(contentType)
 	lc.cacheMu.Lock()
 	if lc.mediaFlowCache == nil {
 		lc.mediaFlowCache = make(map[string]cachedMediaFlow)
 	}
-	if cached, ok := lc.mediaFlowCache[chatMid]; ok && time.Since(cached.cachedAt) < cached.ttl {
-		// Read the map under the lock: observeInboundMediaFlow may replace it.
-		flow, exists := cached.flowMap[strconv.Itoa(contentType)]
-		if exists {
-			lc.cacheMu.Unlock()
+	// Read everything under the lock: observeInboundMediaFlow may replace the
+	// entry. The decision below uses exactly these values.
+	cached, present := lc.mediaFlowCache[chatMid]
+	age := time.Since(cached.cachedAt)
+	valid := present && age < cached.ttl
+	flow, flowPresent := cached.flowMap[key]
+	entryCount := len(lc.mediaFlowCache)
+	lc.cacheMu.Unlock()
+
+	decision := "ask_server"
+	switch {
+	case valid && flowPresent:
+		decision = "cache_flow"
+	case valid && !cached.learnedOnly:
+		decision = "cache_default_e2ee"
+	}
+	// Diagnostic only (LINE-1C image E2E): shows which client instance and
+	// which cache state each send saw.
+	lookup := lc.UserLogin.Bridge.Log.Debug().
+		Str("client_instance", lc.diagInstance()).
+		Str("login_id", lc.diagLoginID()).
+		Str("chat_mid", chatMid).
+		Int("content_type", contentType).
+		Bool("cache_present", present).
+		Bool("cache_valid", valid).
+		Bool("flow_present", flowPresent).
+		Bool("learned_only", cached.learnedOnly).
+		Int("cache_entry_count", entryCount).
+		Str("decision", decision)
+	if flowPresent {
+		lookup = lookup.Int("flow_value", flow)
+	}
+	if present {
+		lookup = lookup.Int64("ttl_ms_remaining", (cached.ttl - age).Milliseconds())
+	}
+	lookup.Msg("Media flow cache lookup")
+
+	if valid {
+		if flowPresent {
 			return flow == 2
 		}
 		if !cached.learnedOnly {
-			lc.cacheMu.Unlock()
 			return true
 		}
 		// A learned entry does not know this content type: ask the server.
 	}
-	lc.cacheMu.Unlock()
 
 	_, resp, err := callLineResult(lc, context.Background(), func(client *line.Client) (*line.MediaMessageFlowResponse, error) {
 		return client.DetermineMediaMessageFlow(chatMid)
 	})
 	if err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).
+		lc.UserLogin.Bridge.Log.Warn().Err(err).
+			Str("client_instance", lc.diagInstance()).
+			Str("login_id", lc.diagLoginID()).
+			Str("chat_mid", chatMid).
+			Int("content_type", contentType).
 			Msg("Failed to determine media flow, defaulting to E2EE upload")
 		return true
 	}
@@ -259,12 +296,30 @@ func (lc *LineClient) shouldUseE2EEMediaFlow(chatMid string, contentType int) bo
 	}
 
 	lc.cacheMu.Lock()
+	replaced, hadReplaced := lc.mediaFlowCache[chatMid]
 	lc.mediaFlowCache[chatMid] = cachedMediaFlow{
 		flowMap:  resp.FlowMap,
 		cachedAt: time.Now(),
 		ttl:      ttl,
 	}
+	entryCount = len(lc.mediaFlowCache)
 	lc.cacheMu.Unlock()
+
+	// Diagnostic only: this is the only other writer of mediaFlowCache, and it
+	// replaces a learned entry for the whole chat.
+	stored := lc.UserLogin.Bridge.Log.Debug().
+		Str("client_instance", lc.diagInstance()).
+		Str("login_id", lc.diagLoginID()).
+		Str("chat_mid", chatMid).
+		Int("content_type", contentType).
+		Int64("ttl_ms", ttl.Milliseconds()).
+		Bool("replaced_entry", hadReplaced).
+		Bool("replaced_learned_only", hadReplaced && replaced.learnedOnly).
+		Int("cache_entry_count", entryCount)
+	if serverFlow, ok := resp.FlowMap[key]; ok {
+		stored = stored.Int("flow_value", serverFlow)
+	}
+	stored.Msg("Stored media flow from server")
 
 	flow, exists := resp.FlowMap[strconv.Itoa(contentType)]
 	if exists {
@@ -331,9 +386,13 @@ func (lc *LineClient) observeInboundMediaFlow(msg *line.Message, chatMid string,
 		}
 	}
 	lc.mediaFlowCache[chatMid] = entry
+	entryCount := len(lc.mediaFlowCache)
 	lc.cacheMu.Unlock()
 
 	evt := lc.UserLogin.Bridge.Log.Info().
+		Str("client_instance", lc.diagInstance()).
+		Str("login_id", lc.diagLoginID()).
+		Int("cache_entry_count", entryCount).
 		Str("chat_mid", chatMid).
 		Str("msg_id", msg.ID).
 		Int("content_type", int(ContentImage)).
@@ -343,6 +402,20 @@ func (lc *LineClient) observeInboundMediaFlow(msg *line.Message, chatMid string,
 		evt = evt.Int("previous_flow", previousFlow)
 	}
 	evt.Msg("Learned plain media flow from inbound image")
+}
+
+// diagInstance identifies this LineClient inside one process for diagnostic
+// logs. It is the pointer address: never persist or compare it across runs.
+func (lc *LineClient) diagInstance() string {
+	return fmt.Sprintf("%p", lc)
+}
+
+// diagLoginID is the UserLogin ID for diagnostic logs, or "" when unset.
+func (lc *LineClient) diagLoginID() string {
+	if lc.UserLogin == nil || lc.UserLogin.UserLogin == nil {
+		return ""
+	}
+	return string(lc.UserLogin.ID)
 }
 
 func (lc *LineClient) isUserBlocked(mid string) bool {
