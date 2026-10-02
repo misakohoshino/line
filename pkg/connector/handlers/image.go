@@ -18,7 +18,6 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	client := h.NewClient()
 	downloadSource := lineImageDownloadSource(data)
 	if downloadSource.publicPath == "" && downloadSource.oid == "" {
 		return nil, nil
@@ -26,11 +25,6 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 
 	mediaCategory := lineMediaCategory(data.ContentMetadata)
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, downloadSource.isPlainMedia)
-	talkMetaMessageID := obsTalkMetaMessageID(data.ID, downloadSource.isPlainMedia)
-
-	var imgData []byte
-	var err error
-	dlStart := time.Now()
 	h.Log.Debug().
 		Str("oid", downloadSource.oid).
 		Str("msg_id", data.ID).
@@ -40,27 +34,17 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		Bool("plain_media", downloadSource.isPlainMedia).
 		Bool("public_resource", downloadSource.publicPath != "").
 		Msg("Downloading image from LINE OBS")
-	if downloadSource.publicPath != "" {
-		imgData, err = client.DownloadOBSPublicResource(ctx, downloadSource.publicPath)
-	} else if downloadSource.isPlainMedia {
-		imgData, err = client.DownloadOBSWithSIDOptions(ctx, downloadSource.oid, talkMetaMessageID, "m", downloadOptions)
-	} else {
-		imgData, err = client.DownloadOBSWithOptions(ctx, downloadSource.oid, talkMetaMessageID, downloadOptions)
-	}
-
-	// Refresh token if we get a 401
-	if downloadSource.publicPath == "" {
-		if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-			client = newClient
-			if downloadSource.isPlainMedia {
-				imgData, err = client.DownloadOBSWithSIDOptions(ctx, downloadSource.oid, talkMetaMessageID, "m", downloadOptions)
-			} else {
-				imgData, err = client.DownloadOBSWithOptions(ctx, downloadSource.oid, talkMetaMessageID, downloadOptions)
-			}
-		}
-		h.handleFinalAuthError(ctx, client, err)
-	}
-	downloadDuration := time.Since(dlStart)
+	fetched, err := h.fetchMedia(ctx, mediaFetchRequest{
+		MessageID:  data.ID,
+		OID:        downloadSource.oid,
+		PublicPath: downloadSource.publicPath,
+		SID:        "m",
+		UseSID:     downloadSource.isPlainMedia,
+		Plain:      downloadSource.isPlainMedia,
+		Options:    downloadOptions,
+	})
+	imgData := fetched.Data
+	downloadDuration := fetched.DownloadDuration
 
 	if err != nil {
 		h.Log.Warn().
