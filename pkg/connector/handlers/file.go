@@ -18,7 +18,6 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 		return oversized, nil
 	}
 
-	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
 
@@ -40,14 +39,15 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 		sid = "m"
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
-	fileData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-
-	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-		client = newClient
-		fileData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-	}
-	h.handleFinalAuthError(ctx, client, err)
+	fetched, err := h.fetchMedia(ctx, mediaFetchRequest{
+		MessageID: data.ID,
+		OID:       oid,
+		SID:       sid,
+		UseSID:    true,
+		Plain:     isPlainMedia,
+		Options:   downloadOptions,
+	})
+	fileData := fetched.Data
 
 	if err != nil {
 		h.Log.Warn().
