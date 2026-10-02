@@ -75,8 +75,9 @@ type fakeLine struct {
 	sent      chan struct{}
 	// contacts answers getContactsV2 (mid -> display name); other mids are
 	// unknown. contactDelay slows getContactsV2 down; set it before use.
-	contacts     map[string]string
-	contactDelay time.Duration
+	contacts       map[string]string
+	contactDelay   time.Duration
+	memberChatMids []string
 }
 
 func newFakeLine() *fakeLine {
@@ -153,6 +154,16 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 		case f.sent <- struct{}{}:
 		default:
 		}
+		return fakeHTTPResponse(req, 200, string(data), nil), nil
+	case "getAllChatMids":
+		data, _ := json.Marshal(map[string]any{
+			"code": 0,
+			"message": "",
+			"data": map[string]any{
+				"memberChatMids":  append([]string(nil), f.memberChatMids...),
+				"invitedChatMids": []string{},
+			},
+		})
 		return fakeHTTPResponse(req, 200, string(data), nil), nil
 	case "getContactsV2":
 		var query line.GetContactsV2Request
