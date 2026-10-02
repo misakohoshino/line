@@ -132,6 +132,13 @@ func TestDIVAControlImageMediaValidation(t *testing.T) {
 			wantStatus: http.StatusBadRequest, wantCode: outboundInvalidRequest,
 		},
 		{
+			name: "unknown member chat", token: divaTestToken,
+			cfg: divaControlConfig{resolveTarget: func(_ context.Context, _ *LineClient, _ string) (string, *divaTargetResolutionError) {
+				return "", divaTargetNotFound()
+			}},
+			wantStatus: http.StatusNotFound, wantCode: outboundTargetNotFound,
+		},
+		{
 			name: "video not enabled", token: divaTestToken,
 			mutate:     func(m map[string]any) { m["message_type"] = "video" },
 			wantStatus: http.StatusBadRequest, wantCode: outboundUnsupportedMessageType,
@@ -166,6 +173,11 @@ func TestDIVAControlImageMediaValidation(t *testing.T) {
 			requireDIVAError(t, status, got, tc.wantStatus, tc.wantCode, deliveryNotSent)
 			if n := len(h.env.fake.sentMessages(t)); n != 0 {
 				t.Fatalf("sendMessage calls = %d", n)
+			}
+			if tc.wantCode == outboundTargetNotFound {
+				if n := len(h.env.fake.snapshot()); n != 0 {
+					t.Fatalf("LINE calls after unknown media target = %d", n)
+				}
 			}
 		})
 	}
