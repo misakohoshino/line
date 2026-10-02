@@ -38,9 +38,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/line"
 	"github.com/rs/zerolog"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 const (
@@ -518,6 +520,112 @@ func selectDIVALogin(logins []*bridgev2.UserLogin, accountMID string) (*LineClie
 }
 
 // ---------------------------------------------------------------------------
+// target resolve / known-chat validation
+// ---------------------------------------------------------------------------
+
+type divaTargetResolutionError struct {
+	status    int
+	code      outboundErrorCode
+	retryable bool
+	detail    string
+}
+
+type divaTargetResolver func(context.Context, *LineClient, string) (string, *divaTargetResolutionError)
+
+func divaTargetNotFound() *divaTargetResolutionError {
+	return &divaTargetResolutionError{
+		status:    http.StatusNotFound,
+		code:      outboundTargetNotFound,
+		retryable: false,
+		detail:    "target chat is not a current LINE member chat",
+	}
+}
+
+func divaTargetValidationUnavailable(code outboundErrorCode, detail string) *divaTargetResolutionError {
+	return &divaTargetResolutionError{
+		status:    http.StatusServiceUnavailable,
+		code:      code,
+		retryable: code != outboundLineSessionInvalid,
+		detail:    detail,
+	}
+}
+
+// resolveDIVATarget turns the caller-supplied opaque chat MID into the bridge's
+// canonical Portal ID, but only after LINE confirms the login is currently a
+// member of that exact chat. No case folding or fuzzy lookup is allowed.
+func resolveDIVATarget(ctx context.Context, lc *LineClient, chatID string) (string, *divaTargetResolutionError) {
+	if lc == nil || lc.UserLogin == nil || lc.UserLogin.Bridge == nil {
+		return "", divaTargetValidationUnavailable(outboundInternal, "target validation is unavailable")
+	}
+
+	canonical := ""
+	lc.cacheMu.Lock()
+	_, known := lc.knownMemberChatMIDs[chatID]
+	lc.cacheMu.Unlock()
+	if known {
+		canonical = chatID
+	} else {
+		_, midsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetAllChatMidsResponse, error) {
+			return client.GetAllChatMids(true, true)
+		})
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_id", chatID).
+				Msg("DIVA target membership validation failed")
+			switch line.Classify(err) {
+			case line.ClassSessionInvalid:
+				return "", divaTargetValidationUnavailable(outboundLineSessionInvalid, "LINE session is not valid for target validation")
+			case line.ClassTimeout, line.ClassNetwork, line.ClassServerError:
+				return "", divaTargetValidationUnavailable(outboundLineTransient, "LINE target validation is temporarily unavailable")
+			default:
+				return "", divaTargetValidationUnavailable(outboundInternal, "target validation failed before send")
+			}
+		}
+		if midsResp == nil {
+			return "", divaTargetValidationUnavailable(outboundInternal, "target validation returned no chat list")
+		}
+		lc.setKnownMemberChatMIDs(midsResp.MemberChatMids)
+		for _, mid := range midsResp.MemberChatMids {
+			if mid == chatID {
+				canonical = mid
+				break
+			}
+		}
+		if canonical == "" {
+			return "", divaTargetNotFound()
+		}
+	}
+
+	portalKey := networkid.PortalKey{ID: makePortalID(canonical), Receiver: lc.UserLogin.ID}
+	portal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_id", canonical).
+			Msg("DIVA target existing Portal lookup failed")
+		return "", divaTargetValidationUnavailable(outboundInternal, "target Portal lookup failed before send")
+	}
+	if portal == nil {
+		// Membership was already proven against LINE. Creating the local Portal
+		// identity here is safe and avoids the first-message race where DIVA gets
+		// the inbound event before Matrix portal handling has created its row.
+		portal, err = lc.UserLogin.Bridge.GetPortalByKey(ctx, portalKey)
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_id", canonical).
+				Msg("DIVA target Portal resolve failed")
+			return "", divaTargetValidationUnavailable(outboundInternal, "target Portal resolve failed before send")
+		}
+	}
+	if portal == nil || portal.ID == "" {
+		return "", divaTargetValidationUnavailable(outboundInternal, "target Portal resolve returned no identity")
+	}
+	resolved := string(portal.ID)
+	if resolved != canonical {
+		lc.UserLogin.Bridge.Log.Error().Str("requested_chat_id", canonical).Str("portal_id", resolved).
+			Msg("DIVA target Portal identity mismatch")
+		return "", divaTargetValidationUnavailable(outboundInternal, "target Portal identity mismatch")
+	}
+	return resolved, nil
+}
+
+// ---------------------------------------------------------------------------
 // server
 // ---------------------------------------------------------------------------
 
@@ -526,6 +634,7 @@ type divaSendFunc func(ctx context.Context, lc *LineClient, req *lineOutboundReq
 type divaControlConfig struct {
 	token              string
 	logins             func() []*bridgev2.UserLogin
+	resolveTarget      divaTargetResolver
 	send               divaSendFunc
 	log                zerolog.Logger
 	maxConcurrent      int
@@ -580,6 +689,9 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 	}
 	if cfg.mediaMaxConcurrent <= 0 {
 		cfg.mediaMaxConcurrent = divaControlMediaMaxConcurrent
+	}
+	if cfg.resolveTarget == nil {
+		cfg.resolveTarget = resolveDIVATarget
 	}
 	if cfg.send == nil {
 		cfg.send = func(ctx context.Context, lc *LineClient, req *lineOutboundRequest) (*lineOutboundResult, error) {
@@ -858,6 +970,12 @@ func (s *divaControlServer) submit(reqCtx context.Context, job *divaSendJob) (ou
 	if selErr != nil {
 		return divaErrorResult(job.requestID, selErr.code, false, selErr.detail), selErr.status
 	}
+	resolvedChatID, targetErr := s.cfg.resolveTarget(reqCtx, lc, job.chatID)
+	if targetErr != nil {
+		return divaErrorResult(job.requestID, targetErr.code, targetErr.retryable, targetErr.detail), targetErr.status
+	}
+	job.chatID = resolvedChatID
+	job.req.ChatMID = resolvedChatID
 
 	s.mu.Lock()
 	// Another call may have registered the same request_id meanwhile.
