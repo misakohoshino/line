@@ -312,6 +312,26 @@ func TestDIVAControlTargetsGroupsAndRoomsOnly(t *testing.T) {
 	}
 }
 
+func TestResolveDIVATargetRejectsCaseChangedOpaqueMID(t *testing.T) {
+	env := newSendTestEnv(t, false)
+	env.lc.UserLogin.Client = env.lc
+	const canonical = "CCLwvHR9QU3qworV2HYGB3rDhkiIZVsboNB3Wo7qyZfc"
+	const wrongCase = "CClwvHR9QU3qworV2HYGB3rDhkiIZVsboNB3Wo7qyZfc"
+	env.fake.memberChatMids = []string{canonical}
+
+	resolved, targetErr := resolveDIVATarget(context.Background(), env.lc, wrongCase)
+	if resolved != "" {
+		t.Fatalf("resolved = %q, want empty", resolved)
+	}
+	if targetErr == nil || targetErr.code != outboundTargetNotFound || targetErr.retryable || targetErr.status != http.StatusNotFound {
+		t.Fatalf("targetErr = %+v", targetErr)
+	}
+	methods := env.fake.methods()
+	if len(methods) != 1 || methods[0] != "getAllChatMids" {
+		t.Fatalf("LINE methods = %v, want only getAllChatMids", methods)
+	}
+}
+
 func TestDIVAControlKnownChatValidationGate(t *testing.T) {
 	t.Run("unknown target stops before LINE", func(t *testing.T) {
 		h := newDIVAControlHarness(t, divaControlConfig{
