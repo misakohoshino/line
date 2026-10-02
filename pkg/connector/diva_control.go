@@ -128,9 +128,9 @@ type divaSendMediaMetadata struct {
 		ChatID     string  `json:"chat_id"`
 		AccountMID *string `json:"account_mid"`
 	} `json:"target"`
-	MessageType string    `json:"message_type"`
-	FileName    string    `json:"file_name,omitempty"`
-	MimeType    string    `json:"mime_type,omitempty"`
+	MessageType string `json:"message_type"`
+	FileName    string `json:"file_name,omitempty"`
+	MimeType    string `json:"mime_type,omitempty"`
 	Relations   *struct {
 		ReplyTo *struct {
 			MessageID string `json:"message_id"`
