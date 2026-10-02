@@ -126,7 +126,7 @@ func TestDIVAControlImageMediaValidation(t *testing.T) {
 		},
 		{
 			name: "direct user target", token: divaTestToken,
-			mutate:     func(m map[string]any) {
+			mutate: func(m map[string]any) {
 				m["target"] = map[string]any{"chat_id": sendTestPeer, "account_mid": nil}
 			},
 			wantStatus: http.StatusBadRequest, wantCode: outboundInvalidRequest,
