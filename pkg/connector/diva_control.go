@@ -44,20 +44,20 @@ import (
 )
 
 const (
-	divaControlDefaultListen         = ":8090"
-	divaControlMinTokenLength        = 32
-	divaControlMaxBodyBytes          = 1 << 20
-	divaControlDefaultMediaMaxBytes  = 32 << 20
-	divaControlMediaMaxConcurrent    = 2
-	divaControlMediaMaxPending       = 4
-	divaControlMediaReadTimeout      = 2 * time.Minute
-	divaControlMaxConcurrent         = 4
-	divaControlMaxPending            = 64
-	divaControlMaxEntries            = 10000
-	divaControlResultTTL             = 10 * time.Minute
-	divaControlDefaultWait           = 15 * time.Second
-	divaControlMinWait               = 100 * time.Millisecond
-	divaControlMaxWait               = 30 * time.Second
+	divaControlDefaultListen        = ":8090"
+	divaControlMinTokenLength       = 32
+	divaControlMaxBodyBytes         = 1 << 20
+	divaControlDefaultMediaMaxBytes = 32 << 20
+	divaControlMediaMaxConcurrent   = 2
+	divaControlMediaMaxPending      = 4
+	divaControlMediaReadTimeout     = 2 * time.Minute
+	divaControlMaxConcurrent        = 4
+	divaControlMaxPending           = 64
+	divaControlMaxEntries           = 10000
+	divaControlResultTTL            = 10 * time.Minute
+	divaControlDefaultWait          = 15 * time.Second
+	divaControlMinWait              = 100 * time.Millisecond
+	divaControlMaxWait              = 30 * time.Second
 	// divaControlSendBudget bounds one background send. The core may make
 	// several LINE calls (retries), each limited by the 30 s HTTP client.
 	divaControlSendBudget = 3 * time.Minute
@@ -128,9 +128,9 @@ type divaSendMediaMetadata struct {
 		ChatID     string  `json:"chat_id"`
 		AccountMID *string `json:"account_mid"`
 	} `json:"target"`
-	MessageType string  `json:"message_type"`
-	FileName    string  `json:"file_name,omitempty"`
-	MimeType    string  `json:"mime_type,omitempty"`
+	MessageType string    `json:"message_type"`
+	FileName    string    `json:"file_name,omitempty"`
+	MimeType    string    `json:"mime_type,omitempty"`
 	Relations   *struct {
 		ReplyTo *struct {
 			MessageID string `json:"message_id"`
@@ -364,7 +364,7 @@ func parseDIVASendMediaMetadata(raw divaSendMediaMetadata, data []byte, multipar
 	}
 	fp, _ := json.Marshal(struct {
 		AccountMID, ChatID, MessageType, FileName, MimeType, ReplyTo, ReplyFallback string
-		MediaSHA256                                                               [32]byte
+		MediaSHA256                                                                 [32]byte
 	}{
 		accountMID, raw.Target.ChatID, raw.MessageType, fileName, mimeType, replyTo, replyFallback, mediaHash,
 	})
