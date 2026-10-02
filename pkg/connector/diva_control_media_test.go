@@ -126,19 +126,19 @@ func TestDIVAControlImageMediaValidation(t *testing.T) {
 		},
 		{
 			name: "direct user target", token: divaTestToken,
-			mutate: func(m map[string]any) {
+			mutate:     func(m map[string]any) {
 				m["target"] = map[string]any{"chat_id": sendTestPeer, "account_mid": nil}
 			},
 			wantStatus: http.StatusBadRequest, wantCode: outboundInvalidRequest,
 		},
 		{
 			name: "video not enabled", token: divaTestToken,
-			mutate: func(m map[string]any) { m["message_type"] = "video" },
+			mutate:     func(m map[string]any) { m["message_type"] = "video" },
 			wantStatus: http.StatusBadRequest, wantCode: outboundUnsupportedMessageType,
 		},
 		{
 			name: "mime mismatch", token: divaTestToken,
-			mutate: func(m map[string]any) { m["mime_type"] = "image/jpeg" },
+			mutate:     func(m map[string]any) { m["mime_type"] = "image/jpeg" },
 			wantStatus: http.StatusBadRequest, wantCode: outboundInvalidRequest,
 		},
 		{
@@ -147,7 +147,7 @@ func TestDIVAControlImageMediaValidation(t *testing.T) {
 		},
 		{
 			name: "over media limit", token: divaTestToken,
-			cfg: divaControlConfig{mediaMaxBytes: int64(len(data) - 1)},
+			cfg:        divaControlConfig{mediaMaxBytes: int64(len(data) - 1)},
 			wantStatus: http.StatusRequestEntityTooLarge, wantCode: outboundInvalidRequest,
 		},
 	}
