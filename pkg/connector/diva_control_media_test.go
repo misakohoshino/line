@@ -10,8 +10,6 @@ import (
 	"net/http"
 	"testing"
 	"time"
-
-	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
 func divaImageMetadata(requestID, chatID string) map[string]any {
@@ -196,7 +194,7 @@ func TestDIVAControlRejectsTooManyPendingMediaSends(t *testing.T) {
 			started <- struct{}{}
 			select {
 			case <-release:
-				return &lineOutboundResult{Sent: &line.Message{ID: "srv-media", To: req.ChatMID}, SentAt: time.Now()}, nil
+				return nil, nil
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
@@ -206,8 +204,17 @@ func TestDIVAControlRejectsTooManyPendingMediaSends(t *testing.T) {
 
 	data := testPNG(t)
 	for i := 0; i < divaControlMediaMaxPending; i++ {
-		meta := divaImageMetadata(newDIVARequestID(), fmt.Sprintf("cmedia%030d", i))
-		go h.postMedia(t, divaTestToken, meta, data)
+		metaMap := divaImageMetadata(newDIVARequestID(), fmt.Sprintf("cmedia%030d", i))
+		metaJSON, _ := json.Marshal(metaMap)
+		var raw divaSendMediaMetadata
+		if err := json.Unmarshal(metaJSON, &raw); err != nil {
+			t.Fatal(err)
+		}
+		job, reqErr := parseDIVASendMediaMetadata(raw, data, "upload.png")
+		if reqErr != nil {
+			t.Fatalf("parse media job: %v", reqErr)
+		}
+		go h.s.submit(context.Background(), job)
 	}
 	for i := 0; i < divaControlMediaMaxPending; i++ {
 		select {
@@ -217,8 +224,17 @@ func TestDIVAControlRejectsTooManyPendingMediaSends(t *testing.T) {
 		}
 	}
 
-	status, got := h.postMedia(t, divaTestToken,
-		divaImageMetadata(newDIVARequestID(), "coverflow000000000000000000000000000"), data)
+	metaMap := divaImageMetadata(newDIVARequestID(), "coverflow000000000000000000000000000")
+	metaJSON, _ := json.Marshal(metaMap)
+	var raw divaSendMediaMetadata
+	if err := json.Unmarshal(metaJSON, &raw); err != nil {
+		t.Fatal(err)
+	}
+	job, reqErr := parseDIVASendMediaMetadata(raw, data, "upload.png")
+	if reqErr != nil {
+		t.Fatalf("parse overflow media job: %v", reqErr)
+	}
+	got, status := h.s.submit(t.Context(), job)
 	requireDIVAError(t, status, got, http.StatusServiceUnavailable, outboundInternal, deliveryNotSent)
 }
 
