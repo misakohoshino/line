@@ -53,6 +53,13 @@ func newDIVAControlHarness(t *testing.T, cfg divaControlConfig) *divaControlHarn
 	if cfg.logins == nil {
 		cfg.logins = func() []*bridgev2.UserLogin { return []*bridgev2.UserLogin{env.lc.UserLogin} }
 	}
+	// Most endpoint tests exercise request/send semantics, not Production target
+	// discovery. Focused tests below override this resolver explicitly.
+	if cfg.resolveTarget == nil {
+		cfg.resolveTarget = func(_ context.Context, _ *LineClient, chatID string) (string, *divaTargetResolutionError) {
+			return chatID, nil
+		}
+	}
 	cfg.log = zerolog.New(io.Discard)
 	s := newDIVAControlServer(cfg)
 	srv := httptest.NewServer(s.handler())
@@ -303,6 +310,82 @@ func TestDIVAControlTargetsGroupsAndRoomsOnly(t *testing.T) {
 	if err != nil || res == nil || res.Sent == nil {
 		t.Fatalf("shared core direct send: res=%+v err=%v", res, err)
 	}
+}
+
+func TestResolveDIVATargetRejectsCaseChangedOpaqueMID(t *testing.T) {
+	env := newSendTestEnv(t, false)
+	env.lc.UserLogin.Client = env.lc
+	const canonical = "CCLwvHR9QU3qworV2HYGB3rDhkiIZVsboNB3Wo7qyZfc"
+	const wrongCase = "CClwvHR9QU3qworV2HYGB3rDhkiIZVsboNB3Wo7qyZfc"
+	env.fake.memberChatMids = []string{canonical}
+
+	resolved, targetErr := resolveDIVATarget(context.Background(), env.lc, wrongCase)
+	if resolved != "" {
+		t.Fatalf("resolved = %q, want empty", resolved)
+	}
+	if targetErr == nil || targetErr.code != outboundTargetNotFound || targetErr.retryable || targetErr.status != http.StatusNotFound {
+		t.Fatalf("targetErr = %+v", targetErr)
+	}
+	methods := env.fake.methods()
+	if len(methods) != 1 || methods[0] != "getAllChatMids" {
+		t.Fatalf("LINE methods = %v, want only getAllChatMids", methods)
+	}
+}
+
+func TestDIVAControlKnownChatValidationGate(t *testing.T) {
+	t.Run("unknown target stops before LINE", func(t *testing.T) {
+		h := newDIVAControlHarness(t, divaControlConfig{
+			resolveTarget: func(_ context.Context, _ *LineClient, _ string) (string, *divaTargetResolutionError) {
+				return "", divaTargetNotFound()
+			},
+		})
+		status, got := h.post(t, divaTextBody(newDIVARequestID(), sendTestGroup, "must not send"))
+		requireDIVAError(t, status, got, http.StatusNotFound, outboundTargetNotFound, deliveryNotSent)
+		if got.Error.Retryable {
+			t.Fatalf("TARGET_NOT_FOUND retryable = true")
+		}
+		if n := len(h.env.fake.snapshot()); n != 0 {
+			t.Fatalf("LINE calls after unknown target = %d", n)
+		}
+	})
+
+	t.Run("resolved canonical target is used by send core", func(t *testing.T) {
+		const requested = "crequested000000000000000000000000"
+		const canonical = "ccanonical00000000000000000000000"
+		h := newDIVAControlHarness(t, divaControlConfig{
+			resolveTarget: func(_ context.Context, _ *LineClient, chatID string) (string, *divaTargetResolutionError) {
+				if chatID != requested {
+					t.Fatalf("resolver chatID = %q, want %q", chatID, requested)
+				}
+				return canonical, nil
+			},
+		})
+		status, got := h.post(t, divaTextBody(newDIVARequestID(), requested, "canonical"))
+		requireDIVAOK(t, status, got)
+		if got.Message == nil || got.Message.ChatID != canonical {
+			t.Fatalf("result message = %+v", got.Message)
+		}
+		sent := h.env.fake.sentMessages(t)
+		if len(sent) != 1 || sent[0].Msg.To != canonical {
+			t.Fatalf("sent = %+v", sent)
+		}
+	})
+
+	t.Run("validation infrastructure error is retryable and not sent", func(t *testing.T) {
+		h := newDIVAControlHarness(t, divaControlConfig{
+			resolveTarget: func(_ context.Context, _ *LineClient, _ string) (string, *divaTargetResolutionError) {
+				return "", divaTargetValidationUnavailable(outboundLineTransient, "temporary validation failure")
+			},
+		})
+		status, got := h.post(t, divaTextBody(newDIVARequestID(), sendTestGroup, "retry later"))
+		requireDIVAError(t, status, got, http.StatusServiceUnavailable, outboundLineTransient, deliveryNotSent)
+		if !got.Error.Retryable {
+			t.Fatalf("LINE_TRANSIENT retryable = false")
+		}
+		if n := len(h.env.fake.snapshot()); n != 0 {
+			t.Fatalf("LINE calls after validation failure = %d", n)
+		}
+	})
 }
 
 func TestDIVAControlMentions(t *testing.T) {

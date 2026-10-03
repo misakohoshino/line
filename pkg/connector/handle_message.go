@@ -133,11 +133,11 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int, origin
 	senderID := makeUserID(msg.From)
 	bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, portalIDStr, opType)
 
-	// A plain image LINE actually delivered here tells us this chat's media flow.
-	lc.observeInboundMediaFlow(msg, portalIDStr, origin)
-
 	// DIVA adapter: hand group/room messages to the DIVA worker before Matrix
-	// portal handling, so Matrix room errors cannot hide the event.
+	// portal handling, so Matrix room errors cannot hide the event. For media,
+	// unwrappedText remains the decrypted media envelope (e.g. keyMaterial JSON)
+	// because such envelopes have no "text" field; the adapter may use it only
+	// to decrypt live media bytes and never serializes it into the v2 event.
 	lc.handleDIVAInbound(msg, portalIDStr, unwrappedText, decryptionFailed, opType, origin)
 
 	messageEvent := &simplevent.Message[line.Message]{

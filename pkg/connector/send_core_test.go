@@ -72,15 +72,12 @@ type fakeLine struct {
 	sends     int
 	oids      int
 	mediaFlow map[string]int
-	// mediaFlowStatus, when set, makes determineMediaMessageFlow fail with
-	// this HTTP status and mediaFlowBody (Production has seen 500/99999).
-	mediaFlowStatus int
-	mediaFlowBody   string
-	sent            chan struct{}
+	sent      chan struct{}
 	// contacts answers getContactsV2 (mid -> display name); other mids are
 	// unknown. contactDelay slows getContactsV2 down; set it before use.
-	contacts     map[string]string
-	contactDelay time.Duration
+	contacts       map[string]string
+	contactDelay   time.Duration
+	memberChatMids []string
 }
 
 func newFakeLine() *fakeLine {
@@ -158,6 +155,16 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 		default:
 		}
 		return fakeHTTPResponse(req, 200, string(data), nil), nil
+	case "getAllChatMids":
+		data, _ := json.Marshal(map[string]any{
+			"code":    0,
+			"message": "",
+			"data": map[string]any{
+				"memberChatMids":  append([]string(nil), f.memberChatMids...),
+				"invitedChatMids": []string{},
+			},
+		})
+		return fakeHTTPResponse(req, 200, string(data), nil), nil
 	case "getContactsV2":
 		var query line.GetContactsV2Request
 		if len(args) > 0 {
@@ -174,9 +181,6 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 	case "acquireEncryptedAccessToken":
 		return fakeHTTPResponse(req, 200, `{"code":0,"message":"","data":"3600\u001eobs-token"}`, nil), nil
 	case "determineMediaMessageFlow":
-		if f.mediaFlowStatus != 0 {
-			return fakeHTTPResponse(req, f.mediaFlowStatus, f.mediaFlowBody, nil), nil
-		}
 		data, _ := json.Marshal(map[string]any{
 			"code": 0, "message": "",
 			"data": map[string]any{"flowMap": f.mediaFlow, "cacheTtlMillis": "60000"},

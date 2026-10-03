@@ -132,8 +132,15 @@ func TestDIVAControlImageMediaValidation(t *testing.T) {
 			wantStatus: http.StatusBadRequest, wantCode: outboundInvalidRequest,
 		},
 		{
-			name: "video not enabled", token: divaTestToken,
-			mutate:     func(m map[string]any) { m["message_type"] = "video" },
+			name: "unknown member chat", token: divaTestToken,
+			cfg: divaControlConfig{resolveTarget: func(_ context.Context, _ *LineClient, _ string) (string, *divaTargetResolutionError) {
+				return "", divaTargetNotFound()
+			}},
+			wantStatus: http.StatusNotFound, wantCode: outboundTargetNotFound,
+		},
+		{
+			name: "sticker not enabled on media endpoint", token: divaTestToken,
+			mutate:     func(m map[string]any) { m["message_type"] = "sticker" },
 			wantStatus: http.StatusBadRequest, wantCode: outboundUnsupportedMessageType,
 		},
 		{
@@ -167,9 +174,100 @@ func TestDIVAControlImageMediaValidation(t *testing.T) {
 			if n := len(h.env.fake.sentMessages(t)); n != 0 {
 				t.Fatalf("sendMessage calls = %d", n)
 			}
+			if tc.wantCode == outboundTargetNotFound {
+				if n := len(h.env.fake.snapshot()); n != 0 {
+					t.Fatalf("LINE calls after unknown media target = %d", n)
+				}
+			}
 		})
 	}
 }
+
+func TestParseDIVASendMediaMetadataVideoAudioFile(t *testing.T) {
+	cases := []struct {
+		name        string
+		messageType string
+		mimeType    string
+		duration    *int
+		wantType    ContentType
+	}{
+		{name: "video", messageType: "video", mimeType: "video/mp4", duration: ptrInt(3100), wantType: ContentVideo},
+		{name: "audio", messageType: "audio", mimeType: "audio/mp4", duration: ptrInt(4200), wantType: ContentAudio},
+		{name: "file", messageType: "file", mimeType: "application/pdf", wantType: ContentFile},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			metaMap := divaImageMetadata(newDIVARequestID(), sendTestGroup)
+			metaMap["message_type"] = tc.messageType
+			metaMap["mime_type"] = tc.mimeType
+			metaMap["file_name"] = tc.name + ".bin"
+			if tc.duration != nil {
+				metaMap["duration_ms"] = *tc.duration
+			} else {
+				delete(metaMap, "duration_ms")
+			}
+			rawBytes, _ := json.Marshal(metaMap)
+			var raw divaSendMediaMetadata
+			if err := json.Unmarshal(rawBytes, &raw); err != nil {
+				t.Fatal(err)
+			}
+			job, reqErr := parseDIVASendMediaMetadata(raw, []byte("binary-media"), "upload.bin")
+			if reqErr != nil {
+				t.Fatalf("parse %s: %v", tc.name, reqErr)
+			}
+			if job.req.ContentType != tc.wantType {
+				t.Fatalf("content type = %d, want %d", job.req.ContentType, tc.wantType)
+			}
+			if job.req.Media.MimeType != tc.mimeType {
+				t.Fatalf("mime = %q, want %q", job.req.Media.MimeType, tc.mimeType)
+			}
+			wantDuration := 0
+			if tc.duration != nil {
+				wantDuration = *tc.duration
+			}
+			if job.req.Media.Duration != wantDuration {
+				t.Fatalf("duration = %d, want %d", job.req.Media.Duration, wantDuration)
+			}
+		})
+	}
+}
+
+func TestDIVASendMediaTypeSpecificValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		messageType string
+		mimeType    string
+		duration    *int
+	}{
+		{name: "video rejects audio mime", messageType: "video", mimeType: "audio/mp4"},
+		{name: "audio rejects video mime", messageType: "audio", mimeType: "video/mp4"},
+		{name: "file rejects duration", messageType: "file", mimeType: "application/pdf", duration: ptrInt(1)},
+		{name: "image rejects duration", messageType: "image", mimeType: "image/png", duration: ptrInt(1)},
+		{name: "negative duration", messageType: "audio", mimeType: "audio/mp4", duration: ptrInt(-1)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			metaMap := divaImageMetadata(newDIVARequestID(), sendTestGroup)
+			metaMap["message_type"] = tc.messageType
+			metaMap["mime_type"] = tc.mimeType
+			if tc.duration != nil {
+				metaMap["duration_ms"] = *tc.duration
+			}
+			rawBytes, _ := json.Marshal(metaMap)
+			var raw divaSendMediaMetadata
+			_ = json.Unmarshal(rawBytes, &raw)
+			data := []byte("binary")
+			if tc.messageType == "image" {
+				data = testPNG(t)
+			}
+			if _, reqErr := parseDIVASendMediaMetadata(raw, data, "upload.bin"); reqErr == nil || reqErr.code != outboundInvalidRequest {
+				t.Fatalf("reqErr = %+v", reqErr)
+			}
+		})
+	}
+}
+
+func ptrInt(v int) *int { return &v }
 
 func TestDIVAControlMediaDefaults(t *testing.T) {
 	h := newDIVAControlHarness(t, divaControlConfig{})

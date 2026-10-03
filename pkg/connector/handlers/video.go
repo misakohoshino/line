@@ -20,56 +20,22 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	client := h.NewClient()
-	oid := data.ContentMetadata["OID"]
-	isPlainMedia := oid == ""
-
-	if oid == "" && decryptedBody != "" && strings.Contains(decryptedBody, "OID") {
-		var decryptInfo struct {
-			OID         string `json:"OID"`
-			KeyMaterial string `json:"keyMaterial"`
-			FileName    string `json:"fileName"`
-		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.OID != "" {
-			oid = decryptInfo.OID
-			isPlainMedia = false
-		}
-	}
-
-	// For plain media, the video is stored at r/talk/m/{messageID}
-	if isPlainMedia {
-		oid = data.ID
-	}
-
-	if oid == "" {
+	fetched, err := h.FetchMedia(ctx, MediaKindVideo, data, decryptedBody)
+	if fetched == nil {
 		return nil, nil
 	}
-
-	sid := "emv"
-	if isPlainMedia {
-		sid = "m"
-	}
-	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
-	dlStart := time.Now()
-	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-
-	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-		client = newClient
-		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-	}
-	h.handleFinalAuthError(ctx, client, err)
-
 	if err != nil {
 		h.Log.Warn().
 			Err(err).
-			Str("oid", oid).
+			Str("oid", fetched.OID).
 			Str("msg_id", data.ID).
-			Bool("plain_media", isPlainMedia).
-			Dur("download_duration", time.Since(dlStart)).
+			Bool("plain_media", fetched.IsPlainMedia).
+			Dur("download_duration", fetched.DownloadDuration).
 			Msg("Failed to download video from OBS")
 		return mediaDownloadFailure("Video", err, relatesTo)
 	}
+
+	videoData := fetched.Data
 
 	videoData, err = h.decryptDownloadedMedia(videoData, decryptedBody, data.ContentMetadata, "video")
 	if err != nil {
@@ -111,7 +77,7 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		Str("mxc", mxc.ParseOrIgnore().String()).
 		Str("file_name", fileName).
 		Int("size", len(videoData)).
-		Dur("download_duration", time.Since(dlStart)).
+		Dur("download_duration", time.Since(fetched.DownloadStartedAt)).
 		Msg("Successfully uploaded video to Matrix")
 
 	var duration int

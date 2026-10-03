@@ -38,9 +38,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/line"
 	"github.com/rs/zerolog"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 const (
@@ -131,6 +133,7 @@ type divaSendMediaMetadata struct {
 	MessageType string `json:"message_type"`
 	FileName    string `json:"file_name,omitempty"`
 	MimeType    string `json:"mime_type,omitempty"`
+	DurationMS  *int   `json:"duration_ms,omitempty"`
 	Relations   *struct {
 		ReplyTo *struct {
 			MessageID string `json:"message_id"`
@@ -147,6 +150,9 @@ const (
 	divaReplyFallbackDrop   = "send_without_reply"
 	divaMessageTypeText     = "text"
 	divaMessageTypeImage    = "image"
+	divaMessageTypeVideo    = "video"
+	divaMessageTypeAudio    = "audio"
+	divaMessageTypeFile     = "file"
 	divaSendContractVersion = 1
 )
 
@@ -278,7 +284,7 @@ func parseDIVASendRequest(body []byte) (*divaSendRequest, *divaSendJob, *divaReq
 	return &raw, job, nil
 }
 
-// parseDIVASendMediaMetadata validates the metadata and image bytes and builds
+// parseDIVASendMediaMetadata validates media metadata/binary and builds
 // the same send job used by /diva/v1/send. It never touches LINE.
 func parseDIVASendMediaMetadata(raw divaSendMediaMetadata, data []byte, multipartFileName string) (*divaSendJob, *divaRequestError) {
 	if raw.Version == nil || *raw.Version != divaSendContractVersion {
@@ -297,29 +303,67 @@ func parseDIVASendMediaMetadata(raw divaSendMediaMetadata, data []byte, multipar
 			return nil, invalidRequest("target.account_mid must be a LINE user MID or null")
 		}
 	}
-	if raw.MessageType != divaMessageTypeImage {
-		return nil, &divaRequestError{
-			status: http.StatusBadRequest,
-			code:   outboundUnsupportedMessageType,
-			detail: fmt.Sprintf("message_type %q is not supported by /diva/v1/send-media; only %q", raw.MessageType, divaMessageTypeImage),
-		}
-	}
 	if len(data) == 0 {
 		return nil, invalidRequest("media must not be empty")
 	}
-	detectedMIME := http.DetectContentType(data)
-	switch detectedMIME {
-	case "image/jpeg", "image/png", "image/gif":
+
+	contentType := ContentImage
+	mimeType := strings.TrimSpace(raw.MimeType)
+	switch raw.MessageType {
+	case divaMessageTypeImage:
+		detectedMIME := http.DetectContentType(data)
+		switch detectedMIME {
+		case "image/jpeg", "image/png", "image/gif":
+		default:
+			return nil, invalidRequest("media is not a supported image (JPEG, PNG or GIF)")
+		}
+		if mimeType != "" && mimeType != detectedMIME {
+			return nil, invalidRequest("mime_type %q does not match detected media type %q", mimeType, detectedMIME)
+		}
+		if mimeType == "" {
+			mimeType = detectedMIME
+		}
+		contentType = ContentImage
+	case divaMessageTypeVideo:
+		if mimeType == "" {
+			mimeType = "video/mp4"
+		}
+		if !strings.HasPrefix(strings.ToLower(mimeType), "video/") {
+			return nil, invalidRequest("video mime_type must begin with video/")
+		}
+		contentType = ContentVideo
+	case divaMessageTypeAudio:
+		if mimeType == "" {
+			mimeType = "audio/mp4"
+		}
+		if !strings.HasPrefix(strings.ToLower(mimeType), "audio/") {
+			return nil, invalidRequest("audio mime_type must begin with audio/")
+		}
+		contentType = ContentAudio
+	case divaMessageTypeFile:
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		contentType = ContentFile
 	default:
-		return nil, invalidRequest("media is not a supported image (JPEG, PNG or GIF)")
+		return nil, &divaRequestError{
+			status: http.StatusBadRequest,
+			code:   outboundUnsupportedMessageType,
+			detail: fmt.Sprintf("message_type %q is not supported by /diva/v1/send-media", raw.MessageType),
+		}
 	}
-	if raw.MimeType != "" && raw.MimeType != detectedMIME {
-		return nil, invalidRequest("mime_type %q does not match detected media type %q", raw.MimeType, detectedMIME)
+
+	duration := 0
+	if raw.DurationMS != nil {
+		if *raw.DurationMS < 0 {
+			return nil, invalidRequest("duration_ms must be >= 0")
+		}
+		if contentType != ContentVideo && contentType != ContentAudio {
+			return nil, invalidRequest("duration_ms is only valid for video or audio")
+		}
+		duration = *raw.DurationMS
 	}
-	mimeType := raw.MimeType
-	if mimeType == "" {
-		mimeType = detectedMIME
-	}
+
 	fileName := strings.TrimSpace(raw.FileName)
 	if fileName == "" {
 		fileName = strings.TrimSpace(multipartFileName)
@@ -356,17 +400,18 @@ func parseDIVASendMediaMetadata(raw divaSendMediaMetadata, data []byte, multipar
 		wait:       wait,
 		req: &lineOutboundRequest{
 			ChatMID:       raw.Target.ChatID,
-			ContentType:   ContentImage,
-			Media:         &outboundMedia{Data: data, MimeType: mimeType, FileName: fileName},
+			ContentType:   contentType,
+			Media:         &outboundMedia{Data: data, MimeType: mimeType, FileName: fileName, Duration: duration},
 			ReplyToID:     replyTo,
 			ReplyFallback: replyFallback == divaReplyFallbackDrop,
 		},
 	}
 	fp, _ := json.Marshal(struct {
 		AccountMID, ChatID, MessageType, FileName, MimeType, ReplyTo, ReplyFallback string
+		DurationMS                                                                  int
 		MediaSHA256                                                                 [32]byte
 	}{
-		accountMID, raw.Target.ChatID, raw.MessageType, fileName, mimeType, replyTo, replyFallback, mediaHash,
+		accountMID, raw.Target.ChatID, raw.MessageType, fileName, mimeType, replyTo, replyFallback, duration, mediaHash,
 	})
 	job.fingerprint = sha256.Sum256(fp)
 	return job, nil
@@ -518,6 +563,112 @@ func selectDIVALogin(logins []*bridgev2.UserLogin, accountMID string) (*LineClie
 }
 
 // ---------------------------------------------------------------------------
+// target resolve / known-chat validation
+// ---------------------------------------------------------------------------
+
+type divaTargetResolutionError struct {
+	status    int
+	code      outboundErrorCode
+	retryable bool
+	detail    string
+}
+
+type divaTargetResolver func(context.Context, *LineClient, string) (string, *divaTargetResolutionError)
+
+func divaTargetNotFound() *divaTargetResolutionError {
+	return &divaTargetResolutionError{
+		status:    http.StatusNotFound,
+		code:      outboundTargetNotFound,
+		retryable: false,
+		detail:    "target chat is not a current LINE member chat",
+	}
+}
+
+func divaTargetValidationUnavailable(code outboundErrorCode, detail string) *divaTargetResolutionError {
+	return &divaTargetResolutionError{
+		status:    http.StatusServiceUnavailable,
+		code:      code,
+		retryable: code != outboundLineSessionInvalid,
+		detail:    detail,
+	}
+}
+
+// resolveDIVATarget turns the caller-supplied opaque chat MID into the bridge's
+// canonical Portal ID, but only after LINE confirms the login is currently a
+// member of that exact chat. No case folding or fuzzy lookup is allowed.
+func resolveDIVATarget(ctx context.Context, lc *LineClient, chatID string) (string, *divaTargetResolutionError) {
+	if lc == nil || lc.UserLogin == nil || lc.UserLogin.Bridge == nil {
+		return "", divaTargetValidationUnavailable(outboundInternal, "target validation is unavailable")
+	}
+
+	canonical := ""
+	lc.cacheMu.Lock()
+	_, known := lc.knownMemberChatMIDs[chatID]
+	lc.cacheMu.Unlock()
+	if known {
+		canonical = chatID
+	} else {
+		_, midsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetAllChatMidsResponse, error) {
+			return client.GetAllChatMids(true, true)
+		})
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_id", chatID).
+				Msg("DIVA target membership validation failed")
+			switch line.Classify(err) {
+			case line.ClassSessionInvalid:
+				return "", divaTargetValidationUnavailable(outboundLineSessionInvalid, "LINE session is not valid for target validation")
+			case line.ClassTimeout, line.ClassNetwork, line.ClassServerError:
+				return "", divaTargetValidationUnavailable(outboundLineTransient, "LINE target validation is temporarily unavailable")
+			default:
+				return "", divaTargetValidationUnavailable(outboundInternal, "target validation failed before send")
+			}
+		}
+		if midsResp == nil {
+			return "", divaTargetValidationUnavailable(outboundInternal, "target validation returned no chat list")
+		}
+		lc.setKnownMemberChatMIDs(midsResp.MemberChatMids)
+		for _, mid := range midsResp.MemberChatMids {
+			if mid == chatID {
+				canonical = mid
+				break
+			}
+		}
+		if canonical == "" {
+			return "", divaTargetNotFound()
+		}
+	}
+
+	portalKey := networkid.PortalKey{ID: makePortalID(canonical), Receiver: lc.UserLogin.ID}
+	portal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_id", canonical).
+			Msg("DIVA target existing Portal lookup failed")
+		return "", divaTargetValidationUnavailable(outboundInternal, "target Portal lookup failed before send")
+	}
+	if portal == nil {
+		// Membership was already proven against LINE. Creating the local Portal
+		// identity here is safe and avoids the first-message race where DIVA gets
+		// the inbound event before Matrix portal handling has created its row.
+		portal, err = lc.UserLogin.Bridge.GetPortalByKey(ctx, portalKey)
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_id", canonical).
+				Msg("DIVA target Portal resolve failed")
+			return "", divaTargetValidationUnavailable(outboundInternal, "target Portal resolve failed before send")
+		}
+	}
+	if portal == nil || portal.ID == "" {
+		return "", divaTargetValidationUnavailable(outboundInternal, "target Portal resolve returned no identity")
+	}
+	resolved := string(portal.ID)
+	if resolved != canonical {
+		lc.UserLogin.Bridge.Log.Error().Str("requested_chat_id", canonical).Str("portal_id", resolved).
+			Msg("DIVA target Portal identity mismatch")
+		return "", divaTargetValidationUnavailable(outboundInternal, "target Portal identity mismatch")
+	}
+	return resolved, nil
+}
+
+// ---------------------------------------------------------------------------
 // server
 // ---------------------------------------------------------------------------
 
@@ -526,6 +677,7 @@ type divaSendFunc func(ctx context.Context, lc *LineClient, req *lineOutboundReq
 type divaControlConfig struct {
 	token              string
 	logins             func() []*bridgev2.UserLogin
+	resolveTarget      divaTargetResolver
 	send               divaSendFunc
 	log                zerolog.Logger
 	maxConcurrent      int
@@ -580,6 +732,9 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 	}
 	if cfg.mediaMaxConcurrent <= 0 {
 		cfg.mediaMaxConcurrent = divaControlMediaMaxConcurrent
+	}
+	if cfg.resolveTarget == nil {
+		cfg.resolveTarget = resolveDIVATarget
 	}
 	if cfg.send == nil {
 		cfg.send = func(ctx context.Context, lc *LineClient, req *lineOutboundRequest) (*lineOutboundResult, error) {
@@ -858,6 +1013,12 @@ func (s *divaControlServer) submit(reqCtx context.Context, job *divaSendJob) (ou
 	if selErr != nil {
 		return divaErrorResult(job.requestID, selErr.code, false, selErr.detail), selErr.status
 	}
+	resolvedChatID, targetErr := s.cfg.resolveTarget(reqCtx, lc, job.chatID)
+	if targetErr != nil {
+		return divaErrorResult(job.requestID, targetErr.code, targetErr.retryable, targetErr.detail), targetErr.status
+	}
+	job.chatID = resolvedChatID
+	job.req.ChatMID = resolvedChatID
 
 	s.mu.Lock()
 	// Another call may have registered the same request_id meanwhile.

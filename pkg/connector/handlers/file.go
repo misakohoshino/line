@@ -18,45 +18,20 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 		return oversized, nil
 	}
 
-	client := h.NewClient()
-	oid := data.ContentMetadata["OID"]
-	isPlainMedia := oid == ""
-
-	if oid == "" && decryptedBody != "" && strings.Contains(decryptedBody, "fileName") {
-		h.Log.Debug().Msg("File message with encrypted payload, OID in metadata")
-	}
-
-	// For plain media, the file is stored at r/talk/m/{messageID}
-	if isPlainMedia {
-		oid = data.ID
-	}
-
-	if oid == "" {
+	fetched, err := h.FetchMedia(ctx, MediaKindFile, data, decryptedBody)
+	if fetched == nil {
 		return nil, nil
 	}
-
-	sid := "emf"
-	if isPlainMedia {
-		sid = "m"
-	}
-	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
-	fileData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-
-	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-		client = newClient
-		fileData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-	}
-	h.handleFinalAuthError(ctx, client, err)
-
 	if err != nil {
 		h.Log.Warn().
 			Err(err).
-			Str("oid", oid).
-			Bool("plain_media", isPlainMedia).
+			Str("oid", fetched.OID).
+			Bool("plain_media", fetched.IsPlainMedia).
 			Msg("Failed to download file from OBS")
 		return mediaDownloadFailure("File", err, relatesTo)
 	}
+
+	fileData := fetched.Data
 
 	var fileName string
 	if strings.Contains(decryptedBody, "fileName") {
