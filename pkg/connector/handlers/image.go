@@ -77,14 +77,8 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}, nil
 }
 
-// ImageFetchResult is a fully downloaded and, when necessary, decrypted LINE image.
-// OID, key material and encrypted chunks never leave the bridge through this type.
-type ImageFetchResult struct {
-	Data             []byte
-	Downloaded       bool
-	DownloadDuration time.Duration
-	DecryptDuration  time.Duration
-}
+// ImageFetchResult is kept as an alias for callers introduced by LINE-1C Inbound Image.
+type ImageFetchResult = FetchedMedia
 
 // FetchImage is the shared image fetch path used by both Matrix conversion and
 // DIVA inbound media delivery. It preserves LINE's public/plain/E2EE source
