@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ type divaReceivedInbound struct {
 	metadata    []byte
 	media       []byte
 	mediaType   string
+	mediaName   string
 }
 
 func startDIVAInboundMediaWorker(t *testing.T) <-chan divaReceivedInbound {
@@ -52,6 +54,7 @@ func startDIVAInboundMediaWorker(t *testing.T) <-chan divaReceivedInbound {
 				return
 			}
 			got.mediaType = mediaPart.Header.Get("Content-Type")
+			got.mediaName = mediaPart.FileName()
 			got.media, _ = io.ReadAll(mediaPart)
 			_ = mediaPart.Close()
 			if extra, err := mr.NextPart(); err == nil {
@@ -208,6 +211,121 @@ func TestDIVAInboundImageMediaFailureFallsBackToJSONOnce(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "sending descriptor only") {
 		t.Fatalf("fallback not logged: %s", logs.String())
+	}
+}
+
+func divaInboundTypedMediaMessage(id string, contentType ContentType, fileName string) *line.Message {
+	meta := map[string]string{"FILE_SIZE": "128"}
+	if fileName != "" {
+		meta["FILE_NAME"] = fileName
+	}
+	return &line.Message{
+		ID: id, From: "usender", To: "cgroup", ToType: int(ToGroup),
+		ContentType: int(contentType), ContentMetadata: meta,
+	}
+}
+
+func TestDIVAInboundLiveVideoAudioFileUseSameMultipart(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType ContentType
+		kind        handlers.MediaKind
+		body        string
+		mimeType    string
+		fileName    string
+		data        []byte
+	}{
+		{"video webm", ContentVideo, handlers.MediaKindVideo, `{"fileName":"clip.webm"}`, "video/webm", "clip.webm", []byte("video-bytes")},
+		{"audio m4a", ContentAudio, handlers.MediaKindAudio, "", "audio/mp4", "audio.m4a", []byte("audio-bytes")},
+		{"file pdf", ContentFile, handlers.MediaKindFile, `{"fileName":"report.pdf"}`, "application/pdf", "report.pdf", []byte("%PDF-file-bytes")},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			received := startDIVAInboundMediaWorker(t)
+			lc := newDIVAV2TestClient(io.Discard)
+			oldPrepare := divaPrepareInboundMedia
+			divaPrepareInboundMedia = func(_ *LineClient, _ context.Context, kind handlers.MediaKind, _ line.Message, decryptedBody string) (*divaInboundMedia, error) {
+				if kind != tc.kind {
+					t.Fatalf("kind = %q, want %q", kind, tc.kind)
+				}
+				if decryptedBody != tc.body {
+					t.Fatalf("decrypted body = %q, want %q", decryptedBody, tc.body)
+				}
+				return &divaInboundMedia{Data: tc.data, MimeType: tc.mimeType, FileName: tc.fileName}, nil
+			}
+			t.Cleanup(func() { divaPrepareInboundMedia = oldPrepare })
+
+			msg := divaInboundTypedMediaMessage(fmt.Sprintf("6000000000000003%02d", i), tc.contentType, tc.fileName)
+			lc.handleDIVAInbound(msg, "cgroup", tc.body, false, int(OpReceiveMessage), divaOriginLive)
+
+			got := receiveDIVAInbound(t, received)
+			if !strings.HasPrefix(got.contentType, "multipart/form-data") ||
+				got.mediaType != tc.mimeType || got.mediaName != tc.fileName || !bytes.Equal(got.media, tc.data) {
+				t.Fatalf("received = %+v", got)
+			}
+			var event map[string]any
+			if err := json.Unmarshal(got.metadata, &event); err != nil {
+				t.Fatal(err)
+			}
+			content, _ := event["content"].(map[string]any)
+			if content["type"] != string(tc.kind) {
+				t.Fatalf("content = %v, want type %q", content, tc.kind)
+			}
+		})
+	}
+}
+
+func TestDIVAInboundBackfillVideoAudioFileNeverFetchesBinary(t *testing.T) {
+	received := startDIVAInboundMediaWorker(t)
+	lc := newDIVAV2TestClient(io.Discard)
+	var prepareCalls atomic.Int32
+
+	oldPrepare := divaPrepareInboundMedia
+	divaPrepareInboundMedia = func(_ *LineClient, _ context.Context, _ handlers.MediaKind, _ line.Message, _ string) (*divaInboundMedia, error) {
+		prepareCalls.Add(1)
+		return nil, errors.New("should not run")
+	}
+	t.Cleanup(func() { divaPrepareInboundMedia = oldPrepare })
+
+	for i, contentType := range []ContentType{ContentVideo, ContentAudio, ContentFile} {
+		msg := divaInboundTypedMediaMessage(fmt.Sprintf("6000000000000004%02d", i), contentType, "")
+		lc.handleDIVAInbound(msg, "cgroup", "", false, int(OpReceiveMessage), divaOriginBackfill)
+	}
+	for range 3 {
+		got := receiveDIVAInbound(t, received)
+		if got.contentType != "application/json" || len(got.media) != 0 {
+			t.Fatalf("backfill request = %+v", got)
+		}
+	}
+	if prepareCalls.Load() != 0 {
+		t.Fatalf("prepare calls = %d, want 0", prepareCalls.Load())
+	}
+}
+
+func TestDIVAMediaFileNameAndMIMEFollowExistingHandlerRules(t *testing.T) {
+	video := line.Message{ContentMetadata: map[string]string{}}
+	name, err := divaMediaFileName(handlers.MediaKindVideo, video, `{"fileName":"clip.webm"}`, "")
+	if err != nil || name != "clip.webm" {
+		t.Fatalf("video name=%q err=%v", name, err)
+	}
+	mimeType, err := divaMediaMimeType(handlers.MediaKindVideo, []byte("x"), name)
+	if err != nil || mimeType != "video/webm" {
+		t.Fatalf("video MIME=%q err=%v", mimeType, err)
+	}
+
+	file := line.Message{ContentMetadata: map[string]string{}}
+	name, err = divaMediaFileName(handlers.MediaKindFile, file, `{"fileName":"report.pdf"}`, "")
+	if err != nil || name != "report.pdf" {
+		t.Fatalf("file name=%q err=%v", name, err)
+	}
+	mimeType, err = divaMediaMimeType(handlers.MediaKindFile, []byte("%PDF"), name)
+	if err != nil || mimeType != "application/pdf" {
+		t.Fatalf("file MIME=%q err=%v", mimeType, err)
+	}
+
+	if _, err = divaMediaFileName(handlers.MediaKindFile, file, `{"fileName":`, ""); err == nil {
+		t.Fatal("malformed encrypted fileName JSON was accepted")
 	}
 }
 
