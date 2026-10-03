@@ -30,9 +30,9 @@ const (
 )
 
 var (
-	divaHTTPClient       = &http.Client{Timeout: defaultDIVAWebhookTimeout}
-	divaMediaHTTPClient  = &http.Client{Timeout: defaultDIVAMediaWebhookTimeout}
-	divaInboundMediaSem  = make(chan struct{}, divaInboundMediaMaxConcurrent)
+	divaHTTPClient      = &http.Client{Timeout: defaultDIVAWebhookTimeout}
+	divaMediaHTTPClient = &http.Client{Timeout: defaultDIVAMediaWebhookTimeout}
+	divaInboundMediaSem = make(chan struct{}, divaInboundMediaMaxConcurrent)
 )
 
 type divaInboundEvent struct {
@@ -333,23 +333,23 @@ func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), mediaLoa
 				media, mediaErr := mediaLoader(mediaCtx)
 				mediaCancel()
 				if mediaErr != nil {
-				// Descriptor JSON is still useful. Media failure must not delete the
-				// event or make LINE receive depend on OBS availability.
-				lc.UserLogin.Bridge.Log.Warn().Err(mediaErr).
-					Str("message_id", messageID).
-					Msg("DIVA inbound image media unavailable; sending descriptor only")
-			} else if media != nil {
-				multipartBody, multipartType, buildErr := buildDIVAInboundMultipart(payload, media)
-				if buildErr != nil {
-					lc.UserLogin.Bridge.Log.Warn().Err(buildErr).
+					// Descriptor JSON is still useful. Media failure must not delete the
+					// event or make LINE receive depend on OBS availability.
+					lc.UserLogin.Bridge.Log.Warn().Err(mediaErr).
 						Str("message_id", messageID).
-						Msg("DIVA inbound image multipart build failed; sending descriptor only")
-				} else {
-					requestBody = multipartBody
-					contentType = multipartType
-					httpClient = divaMediaHTTPClient
-					requestTimeout = defaultDIVAMediaWebhookTimeout
-				}
+						Msg("DIVA inbound image media unavailable; sending descriptor only")
+				} else if media != nil {
+					multipartBody, multipartType, buildErr := buildDIVAInboundMultipart(payload, media)
+					if buildErr != nil {
+						lc.UserLogin.Bridge.Log.Warn().Err(buildErr).
+							Str("message_id", messageID).
+							Msg("DIVA inbound image multipart build failed; sending descriptor only")
+					} else {
+						requestBody = multipartBody
+						contentType = multipartType
+						httpClient = divaMediaHTTPClient
+						requestTimeout = defaultDIVAMediaWebhookTimeout
+					}
 				}
 			}
 		}

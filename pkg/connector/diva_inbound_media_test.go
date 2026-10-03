@@ -211,7 +211,7 @@ func TestPrepareDIVAInboundImageRejectsOversizeMetadataBeforeFetch(t *testing.T)
 	t.Setenv("DIVA_MEDIA_MAX_BYTES", "1024")
 	lc := newDIVAV2TestClient(io.Discard)
 	msg := line.Message{
-		ID: "oversize",
+		ID:              "oversize",
 		ContentMetadata: map[string]string{"FILE_SIZE": "1057"},
 	}
 	media, err := lc.prepareDIVAInboundImage(context.Background(), msg, "")
