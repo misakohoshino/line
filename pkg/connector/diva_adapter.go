@@ -136,7 +136,9 @@ func divaMediaFileName(kind handlers.MediaKind, msg line.Message, decryptedBody,
 			if err := json.Unmarshal([]byte(decryptedBody), &payload); err != nil {
 				return "", fmt.Errorf("failed to parse file payload JSON: %w", err)
 			}
-			name = strings.TrimSpace(payload.FileName)
+			if bodyName := strings.TrimSpace(payload.FileName); bodyName != "" {
+				name = bodyName
+			}
 		}
 		if name == "" {
 			name = "file.bin"
