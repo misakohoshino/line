@@ -31,7 +31,9 @@ func TestMediaFetchSourceForPreservesExistingPaths(t *testing.T) {
 					"OID":          "ignored-oid",
 				},
 			},
-			wantPublic: "/r/official/image",
+			wantPublic:    "/r/official/image",
+			wantSID:       "m",
+			wantMessageID: "img-public",
 		},
 		{
 			name: "image private OID keeps no-SID path",
