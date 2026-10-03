@@ -5,22 +5,33 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/connector/handlers"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
 const (
-	defaultDIVAWebhookTimeout = 2 * time.Second
-	defaultDIVASendTimeout    = 10 * time.Second
+	defaultDIVAWebhookTimeout      = 2 * time.Second
+	defaultDIVAMediaWebhookTimeout = 2 * time.Minute
+	defaultDIVASendTimeout         = 10 * time.Second
+	defaultDIVAInboundMediaMax     = 32 << 20
+	divaEncryptedMediaOverhead     = 32
 )
 
-var divaHTTPClient = &http.Client{Timeout: defaultDIVAWebhookTimeout}
+var (
+	divaHTTPClient      = &http.Client{Timeout: defaultDIVAWebhookTimeout}
+	divaMediaHTTPClient = &http.Client{Timeout: defaultDIVAMediaWebhookTimeout}
+)
 
 type divaInboundEvent struct {
 	Text      string `json:"text"`
@@ -32,6 +43,112 @@ type divaInboundEvent struct {
 type divaInboundDecision struct {
 	OK        bool   `json:"ok"`
 	ReplyText string `json:"reply_text"`
+}
+
+type divaInboundMedia struct {
+	Data     []byte
+	MimeType string
+}
+
+type divaInboundMediaLoader func(context.Context) (*divaInboundMedia, error)
+
+var divaPrepareImageMedia = func(lc *LineClient, ctx context.Context, msg line.Message, decryptedBody string) (*divaInboundMedia, error) {
+	return lc.prepareDIVAInboundImage(ctx, msg, decryptedBody)
+}
+
+func divaInboundMediaMaxBytes() int64 {
+	raw := strings.TrimSpace(os.Getenv("DIVA_MEDIA_MAX_BYTES"))
+	if raw == "" {
+		return defaultDIVAInboundMediaMax
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || parsed <= 0 {
+		return defaultDIVAInboundMediaMax
+	}
+	return parsed
+}
+
+func cloneDIVAImageMessage(msg *line.Message) line.Message {
+	copyMsg := line.Message{ID: msg.ID}
+	if len(msg.ContentMetadata) > 0 {
+		copyMsg.ContentMetadata = make(map[string]string, len(msg.ContentMetadata))
+		for key, value := range msg.ContentMetadata {
+			copyMsg.ContentMetadata[key] = value
+		}
+	}
+	return copyMsg
+}
+
+func (lc *LineClient) prepareDIVAInboundImage(ctx context.Context, msg line.Message, decryptedBody string) (*divaInboundMedia, error) {
+	maxBytes := divaInboundMediaMaxBytes()
+	if rawSize := strings.TrimSpace(msg.ContentMetadata["FILE_SIZE"]); rawSize != "" {
+		if size, err := strconv.ParseInt(rawSize, 10, 64); err == nil && size > maxBytes+divaEncryptedMediaOverhead {
+			return nil, fmt.Errorf("LINE image metadata size %d exceeds DIVA media limit %d", size, maxBytes)
+		}
+	}
+
+	h := lc.newMessageHandler()
+	fetched, err := h.FetchMedia(ctx, handlers.MediaKindImage, msg, decryptedBody)
+	if err != nil {
+		return nil, err
+	}
+	if fetched == nil {
+		return nil, fmt.Errorf("LINE image has no fetchable media source")
+	}
+	if int64(len(fetched.Data)) > maxBytes+divaEncryptedMediaOverhead {
+		return nil, fmt.Errorf("LINE image download size %d exceeds DIVA media limit %d", len(fetched.Data), maxBytes)
+	}
+	imageData, err := h.DecryptFetchedMedia(fetched.Data, decryptedBody, msg.ContentMetadata, handlers.MediaKindImage)
+	if err != nil {
+		return nil, err
+	}
+	if len(imageData) == 0 {
+		return nil, fmt.Errorf("LINE image decrypted to empty media")
+	}
+	if int64(len(imageData)) > maxBytes {
+		return nil, fmt.Errorf("LINE image size %d exceeds DIVA media limit %d", len(imageData), maxBytes)
+	}
+	mimeType := http.DetectContentType(imageData)
+	switch mimeType {
+	case "image/jpeg", "image/png", "image/gif":
+	default:
+		return nil, fmt.Errorf("LINE image has unsupported media type %q", mimeType)
+	}
+	return &divaInboundMedia{Data: imageData, MimeType: mimeType}, nil
+}
+
+func buildDIVAInboundMultipart(metadata []byte, media *divaInboundMedia) ([]byte, string, error) {
+	if media == nil || len(media.Data) == 0 {
+		return nil, "", errors.New("DIVA inbound media is empty")
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+
+	metadataHeader := make(textproto.MIMEHeader)
+	metadataHeader.Set("Content-Disposition", `form-data; name="metadata"`)
+	metadataHeader.Set("Content-Type", "application/json; charset=utf-8")
+	metadataPart, err := writer.CreatePart(metadataHeader)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err = metadataPart.Write(metadata); err != nil {
+		return nil, "", err
+	}
+
+	mediaHeader := make(textproto.MIMEHeader)
+	mediaHeader.Set("Content-Disposition", `form-data; name="media"; filename="image.bin"`)
+	mediaHeader.Set("Content-Type", media.MimeType)
+	mediaPart, err := writer.CreatePart(mediaHeader)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err = mediaPart.Write(media.Data); err != nil {
+		return nil, "", err
+	}
+	if err = writer.Close(); err != nil {
+		return nil, "", err
+	}
+	return body.Bytes(), writer.FormDataContentType(), nil
 }
 
 // Reasons a group/room message is withheld from the legacy (v1) DIVA inbound
@@ -132,8 +249,19 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 		return
 	}
 
-	// The event is built here, while msg is still owned by the receive loop.
-	// Only the sender name lookup and the encoding run in the forward goroutine.
+	// The event and any media fetch input are copied here, while msg is still
+	// owned by the receive loop. Slow name lookup / OBS fetch / HTTP delivery
+	// stay in the forward goroutine and never block LINE receive.
+	var mediaLoader divaInboundMediaLoader
+	if version == divaContractV2 && origin == divaOriginLive &&
+		ContentType(msg.ContentType) == ContentImage && !decryptionFailed {
+		imageMsg := cloneDIVAImageMessage(msg)
+		decryptedBody := unwrappedText
+		mediaLoader = func(ctx context.Context) (*divaInboundMedia, error) {
+			return divaPrepareImageMedia(lc, ctx, imageMsg, decryptedBody)
+		}
+	}
+
 	var encode func() ([]byte, error)
 	if version == divaContractV2 {
 		event := lc.buildDIVAV2Event(msg, chatMID, unwrappedText, decryptionFailed, opType, origin)
@@ -159,7 +287,7 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 		}
 		encode = func() ([]byte, error) { return json.Marshal(event) }
 	}
-	lc.forwardDIVAInbound(encode, chatMID, msg.ID, origin == divaOriginLive)
+	lc.forwardDIVAInbound(encode, mediaLoader, chatMID, msg.ID, origin == divaOriginLive)
 }
 
 // forwardDIVAInbound encodes an inbound event and posts it to the local DIVA
@@ -168,7 +296,7 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 // returns reply_text and allowReply is set, Go sends that text back to the
 // same LINE chat. Backfilled events never get a reply, whatever the worker
 // answers.
-func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), groupID, messageID string, allowReply bool) {
+func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), mediaLoader divaInboundMediaLoader, groupID, messageID string, allowReply bool) {
 	endpoint := strings.TrimSpace(os.Getenv("DIVA_WEBHOOK_URL"))
 	if endpoint == "" {
 		return
@@ -181,17 +309,47 @@ func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), groupID,
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), defaultDIVAWebhookTimeout)
+		requestBody := payload
+		contentType := "application/json"
+		httpClient := divaHTTPClient
+		requestTimeout := defaultDIVAWebhookTimeout
+
+		if mediaLoader != nil {
+			mediaCtx, mediaCancel := context.WithTimeout(context.Background(), defaultDIVAMediaWebhookTimeout)
+			media, mediaErr := mediaLoader(mediaCtx)
+			mediaCancel()
+			if mediaErr != nil {
+				// Descriptor JSON is still useful. Media failure must not delete the
+				// event or make LINE receive depend on OBS availability.
+				lc.UserLogin.Bridge.Log.Warn().Err(mediaErr).
+					Str("message_id", messageID).
+					Msg("DIVA inbound image media unavailable; sending descriptor only")
+			} else if media != nil {
+				multipartBody, multipartType, buildErr := buildDIVAInboundMultipart(payload, media)
+				if buildErr != nil {
+					lc.UserLogin.Bridge.Log.Warn().Err(buildErr).
+						Str("message_id", messageID).
+						Msg("DIVA inbound image multipart build failed; sending descriptor only")
+				} else {
+					requestBody = multipartBody
+					contentType = multipartType
+					httpClient = divaMediaHTTPClient
+					requestTimeout = defaultDIVAMediaWebhookTimeout
+				}
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 		defer cancel()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("DIVA adapter failed to build request")
 			return
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 
-		resp, err := divaHTTPClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("message_id", messageID).Msg("DIVA adapter delivery failed")
 			return
