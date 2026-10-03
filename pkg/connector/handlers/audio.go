@@ -2,10 +2,8 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
@@ -19,54 +17,21 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	client := h.NewClient()
-	oid := data.ContentMetadata["OID"]
-	isPlainMedia := oid == ""
-
-	// If OID is not in ContentMetadata, check decrypted body (E2EE path)
-	if oid == "" && decryptedBody != "" && strings.Contains(decryptedBody, "OID") {
-		var decryptInfo struct {
-			OID         string `json:"OID"`
-			KeyMaterial string `json:"keyMaterial"`
-		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.OID != "" {
-			oid = decryptInfo.OID
-			isPlainMedia = false
-		}
-	}
-
-	// For plain media, the audio is stored at r/talk/m/{messageID}
-	if isPlainMedia {
-		oid = data.ID
-	}
-
-	if oid == "" {
+	fetched, err := h.FetchMedia(ctx, MediaKindAudio, data, decryptedBody)
+	if fetched == nil {
 		return nil, nil
 	}
-
-	sid := "ema"
-	if isPlainMedia {
-		sid = "m"
-	}
-	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
-	audioData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-
-	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-		client = newClient
-		audioData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
-	}
-	h.handleFinalAuthError(ctx, client, err)
-
 	if err != nil {
 		h.Log.Warn().
 			Err(err).
-			Str("oid", oid).
+			Str("oid", fetched.OID).
 			Str("msg_id", data.ID).
-			Bool("plain_media", isPlainMedia).
+			Bool("plain_media", fetched.IsPlainMedia).
 			Msg("Failed to download audio from OBS")
 		return mediaDownloadFailure("Audio", err, relatesTo)
 	}
+
+	audioData := fetched.Data
 
 	audioData, err = h.decryptDownloadedMedia(audioData, decryptedBody, data.ContentMetadata, "audio")
 	if err != nil {

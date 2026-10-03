@@ -737,6 +737,26 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 	}
 
 	// Encryption phase — skip entirely for plain text
+	// fallBackToPlain switches this send to plaintext once the group is known
+	// not to support E2EE, and caches that decision. Text and media share this
+	// single decision; it is the only place a group send downgrades to plain.
+	fallBackToPlain := func(cause error, reason string) {
+		lc.markGroupNoE2EE(portalMid)
+		lc.UserLogin.Bridge.Log.Warn().Err(cause).Str("chat_mid", portalMid).Msg(reason)
+		plainText = true
+		chunks = nil
+		delete(contentMetadata, "e2eeVersion")
+		if contentType == int(ContentText) {
+			plainTextBody = req.Text
+		} else {
+			delete(contentMetadata, "OID")
+			delete(contentMetadata, "SID")
+			delete(contentMetadata, "ENC_KM")
+			plainMediaData = originalMediaData
+			plainThumbData = originalThumbData
+		}
+	}
+
 	if !plainText {
 		if isGroup {
 			if errFetch := lineFetchAndUnwrapGroupKey(lc, ctx, portalMid, 0); errFetch != nil {
@@ -773,22 +793,8 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 				}
 				if err != nil {
 					// E2EE setup failed — fall back to plain text
-					lc.markGroupNoE2EE(portalMid)
-					lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", portalMid).
-						Msg("Failed to set up E2EE for group, falling back to plain text")
-					plainText = true
-					chunks = nil
+					fallBackToPlain(err, "Failed to set up E2EE for group, falling back to plain text")
 					err = nil
-					delete(contentMetadata, "e2eeVersion")
-					if contentType == int(ContentText) {
-						plainTextBody = req.Text
-					} else {
-						delete(contentMetadata, "OID")
-						delete(contentMetadata, "SID")
-						delete(contentMetadata, "ENC_KM")
-						plainMediaData = originalMediaData
-						plainThumbData = originalThumbData
-					}
 				}
 			}
 		} else {
@@ -935,6 +941,21 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 			lc.UserLogin.Bridge.Log.Warn().Str("chat_mid", portalMid).
 				Err(regErr).Msg("autoRegisterGroupKey failed, giving up on retry")
 		}
+	}
+
+	// LINE refuses an E2EE message to a group where a member has Letter
+	// Sealing off (TalkException code 98 "member settings off"), even when a
+	// cached group key let us encrypt it. The message was rejected, not
+	// delivered, so resend once through the same plaintext fallback.
+	if err != nil && isGroup && !plainText && line.IsMemberSettingsOffError(err) {
+		fallBackToPlain(err, "LINE rejected E2EE group send (member settings off), falling back to plain text")
+		lineMsg.Chunks = nil
+		lineMsg.ContentMetadata = contentMetadata
+		if contentType == int(ContentText) {
+			lineMsg.Text = plainTextBody
+		}
+		retryReqSeq := lc.nextReqSeq()
+		sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 	}
 
 	if req.ReplyFallback && shouldRetrySendWithoutReplyRelation(lineMsg, err) {

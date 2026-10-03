@@ -162,6 +162,22 @@ func IsGroupKeyNotRegisteredError(err error) bool {
 		strings.Contains(msg, "group key is not registered")
 }
 
+// IsMemberSettingsOffError returns true when LINE rejects an E2EE message
+// with TalkException code 98 "member settings off": at least one member of
+// the target chat has Letter Sealing disabled, so the chat cannot receive E2EE
+// messages. LINE rejected the message, so it was not delivered.
+func IsMemberSettingsOffError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return hasResponseErrorCode(msg) &&
+		strings.Contains(msg, "talkexception") &&
+		hasJSONCode(msg, 98) &&
+		(strings.Contains(msg, `"reason":"member settings off`) ||
+			strings.Contains(msg, `"reason": "member settings off`))
+}
+
 // IsTalkExceptionNotFound returns true when LINE wraps a TalkException code 5
 // "not found" response. Callers must interpret the method context themselves:
 // the same code can mean different missing resources for different Talk APIs.

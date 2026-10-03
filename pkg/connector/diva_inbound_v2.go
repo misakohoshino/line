@@ -13,10 +13,12 @@ import (
 // DIVA inbound contract v2: a generic LINE event envelope for Server A.
 //
 // Everything here is built from LINE message fields and unencrypted content
-// metadata. The only decrypted value that is ever copied out is the user text
-// of a genuine text message. For media, the decrypted body carries the media
-// keyMaterial and is never read here. ENC_KM, chunks and the decrypted media
-// payload must never appear in a v2 event.
+// metadata. The only decrypted value that is ever copied into this JSON event
+// is the user text of a genuine text message. For media, the decrypted body
+// carries keyMaterial and is never serialized here. ENC_KM, chunks, OID and
+// media bytes must never appear in the v2 JSON metadata. Live media bytes may
+// travel separately as the media part of the same /line/inbound multipart
+// request; backfill remains descriptor-only JSON.
 
 const divaContractV2 = 2
 
