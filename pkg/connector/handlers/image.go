@@ -18,61 +18,25 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	client := h.NewClient()
-	downloadSource := lineImageDownloadSource(data)
-	if downloadSource.publicPath == "" && downloadSource.oid == "" {
+	fetched, err := h.FetchMedia(ctx, MediaKindImage, data, decryptedBody)
+	if fetched == nil {
 		return nil, nil
 	}
-
-	mediaCategory := lineMediaCategory(data.ContentMetadata)
-	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, downloadSource.isPlainMedia)
-	talkMetaMessageID := obsTalkMetaMessageID(data.ID, downloadSource.isPlainMedia)
-
-	var imgData []byte
-	var err error
-	dlStart := time.Now()
-	h.Log.Debug().
-		Str("oid", downloadSource.oid).
-		Str("msg_id", data.ID).
-		Str("tid", downloadOptions.TID).
-		Str("media_category", mediaCategory).
-		Bool("has_obs_pop", downloadOptions.OBSPop != "").
-		Bool("plain_media", downloadSource.isPlainMedia).
-		Bool("public_resource", downloadSource.publicPath != "").
-		Msg("Downloading image from LINE OBS")
-	if downloadSource.publicPath != "" {
-		imgData, err = client.DownloadOBSPublicResource(ctx, downloadSource.publicPath)
-	} else if downloadSource.isPlainMedia {
-		imgData, err = client.DownloadOBSWithSIDOptions(ctx, downloadSource.oid, talkMetaMessageID, "m", downloadOptions)
-	} else {
-		imgData, err = client.DownloadOBSWithOptions(ctx, downloadSource.oid, talkMetaMessageID, downloadOptions)
-	}
-
-	// Refresh token if we get a 401
-	if downloadSource.publicPath == "" {
-		if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-			client = newClient
-			if downloadSource.isPlainMedia {
-				imgData, err = client.DownloadOBSWithSIDOptions(ctx, downloadSource.oid, talkMetaMessageID, "m", downloadOptions)
-			} else {
-				imgData, err = client.DownloadOBSWithOptions(ctx, downloadSource.oid, talkMetaMessageID, downloadOptions)
-			}
-		}
-		h.handleFinalAuthError(ctx, client, err)
-	}
-	downloadDuration := time.Since(dlStart)
+	downloadDuration := fetched.DownloadDuration
 
 	if err != nil {
 		h.Log.Warn().
 			Err(err).
-			Str("oid", downloadSource.oid).
+			Str("oid", fetched.OID).
 			Str("msg_id", data.ID).
-			Bool("plain_media", downloadSource.isPlainMedia).
-			Bool("public_resource", downloadSource.publicPath != "").
+			Bool("plain_media", fetched.IsPlainMedia).
+			Bool("public_resource", fetched.PublicPath != "").
 			Dur("download_duration", downloadDuration).
 			Msg("Failed to download image from OBS")
 		return mediaDownloadFailure("Image", err, relatesTo)
 	}
+
+	imgData := fetched.Data
 
 	// Decrypt encrypted media before it can reach Matrix.
 	decryptStart := time.Now()
