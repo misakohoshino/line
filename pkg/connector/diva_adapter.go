@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -50,7 +51,7 @@ func divaMultipartForwardPayload(metadata, media []byte) (divaForwardPayload, er
 	}
 	// Remote file names stay inside the JSON metadata. A fixed multipart name
 	// avoids treating LINE-provided text as a MIME header value.
-	mediaPart, err := writer.CreateFormFile("media", "image.bin")
+	mediaPart, err := writer.CreateFormFile("media", "media.bin")
 	if err != nil {
 		return divaForwardPayload{}, err
 	}
@@ -65,6 +66,32 @@ func divaMultipartForwardPayload(metadata, media []byte) (divaForwardPayload, er
 		ContentType: writer.FormDataContentType(),
 		Media:       true,
 	}, nil
+}
+
+func isDIVAInboundBinaryMedia(contentType ContentType) bool {
+	switch contentType {
+	case ContentImage, ContentVideo, ContentAudio, ContentFile:
+		return true
+	default:
+		return false
+	}
+}
+
+func (lc *LineClient) fetchDIVAInboundMedia(ctx context.Context, msg line.Message, decryptedBody string) (handlers.FetchedMedia, error) {
+	handler := lc.newMessageHandler()
+	switch ContentType(msg.ContentType) {
+	case ContentImage:
+		return handler.FetchImage(ctx, msg, decryptedBody)
+	case ContentVideo:
+		return handler.FetchVideo(ctx, msg, decryptedBody)
+	case ContentAudio:
+		return handler.FetchAudio(ctx, msg, decryptedBody)
+	case ContentFile:
+		file, err := handler.FetchFile(ctx, msg, decryptedBody)
+		return file.FetchedMedia, err
+	default:
+		return handlers.FetchedMedia{}, fmt.Errorf("content type %d is not binary media", msg.ContentType)
+	}
 }
 
 type divaInboundEvent struct {
@@ -205,11 +232,13 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 			if err != nil {
 				return divaForwardPayload{}, err
 			}
-			if ContentType(msgCopy.ContentType) != ContentImage || origin != divaOriginLive {
+			if !isDIVAInboundBinaryMedia(ContentType(msgCopy.ContentType)) || origin != divaOriginLive {
 				return divaJSONForwardPayload(metadata), nil
 			}
 
-			fetched, fetchErr := lc.newMessageHandler().FetchImage(context.Background(), msgCopy, unwrappedText)
+			mediaCtx, mediaCancel := context.WithTimeout(context.Background(), defaultDIVAMediaWebhookTimeout)
+			defer mediaCancel()
+			fetched, fetchErr := lc.fetchDIVAInboundMedia(mediaCtx, msgCopy, unwrappedText)
 			if fetchErr != nil || len(fetched.Data) == 0 {
 				logEvent := lc.UserLogin.Bridge.Log.Warn().
 					Str("message_id", event.Message.ID).
@@ -217,7 +246,7 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 				if fetchErr != nil {
 					logEvent = logEvent.Err(fetchErr)
 				}
-				logEvent.Msg("DIVA image fetch unavailable, forwarding descriptor only")
+				logEvent.Msg("DIVA media fetch unavailable, forwarding descriptor only")
 				return divaJSONForwardPayload(metadata), nil
 			}
 			if len(fetched.Data) > handlers.BeeperMaxFileSize {
@@ -225,7 +254,7 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 					Str("message_id", event.Message.ID).
 					Int("size_bytes", len(fetched.Data)).
 					Int("limit_bytes", handlers.BeeperMaxFileSize).
-					Msg("DIVA image exceeds media limit, forwarding descriptor only")
+					Msg("DIVA media exceeds limit, forwarding descriptor only")
 				return divaJSONForwardPayload(metadata), nil
 			}
 			return divaMultipartForwardPayload(metadata, fetched.Data)
