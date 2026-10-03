@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -371,6 +372,130 @@ func TestHandleDIVAInboundV2ForwardsBackfillWithoutReplying(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // sender display name for uncached senders (LINE-1B)
+// ---------------------------------------------------------------------------
+// v2 inbound image binary delivery
+// ---------------------------------------------------------------------------
+
+type divaCapturedInbound struct {
+	ContentType string
+	Metadata    []byte
+	Media       []byte
+}
+
+func startDIVAMediaWorker(t *testing.T) <-chan divaCapturedInbound {
+	t.Helper()
+	received := make(chan divaCapturedInbound, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured := divaCapturedInbound{ContentType: r.Header.Get("Content-Type")}
+		if strings.HasPrefix(captured.ContentType, "multipart/form-data;") {
+			if err := r.ParseMultipartForm(2 << 20); err != nil {
+				t.Errorf("parse multipart: %v", err)
+				http.Error(w, "bad multipart", http.StatusBadRequest)
+				return
+			}
+			captured.Metadata = []byte(r.FormValue("metadata"))
+			file, _, err := r.FormFile("media")
+			if err != nil {
+				t.Errorf("media part: %v", err)
+				http.Error(w, "missing media", http.StatusBadRequest)
+				return
+			}
+			captured.Media, _ = io.ReadAll(file)
+			_ = file.Close()
+		} else {
+			captured.Metadata, _ = io.ReadAll(r.Body)
+		}
+		received <- captured
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("DIVA_WEBHOOK_URL", srv.URL+"/line/inbound")
+	t.Setenv("DIVA_CONTRACT_VERSION", "2")
+	return received
+}
+
+func TestDIVAV2InboundImageUsesMultipartBinary(t *testing.T) {
+	env := newSendTestEnv(t, false)
+	received := startDIVAMediaWorker(t)
+	imageData := testPNG(t)
+	const downloadPath = "/r/official/diva-inbound-image"
+	env.fake.obsDownloads[downloadPath] = imageData
+
+	msg := &line.Message{
+		ID: "600000000000000201", From: "udriver", To: sendTestGroup, ToType: int(ToGroup),
+		ContentType: int(ContentImage),
+		ContentMetadata: map[string]string{
+			"DOWNLOAD_URL": downloadPath,
+			"FILE_NAME":    "car.png",
+			"FILE_SIZE":    "1234",
+			"OID":          "must-not-leak",
+		},
+	}
+	started := time.Now()
+	env.lc.handleDIVAInbound(msg, sendTestGroup, "", false, int(OpReceiveMessage), divaOriginLive)
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("image inbound blocked receive loop for %v", elapsed)
+	}
+
+	select {
+	case got := <-received:
+		if !strings.HasPrefix(got.ContentType, "multipart/form-data;") {
+			t.Fatalf("Content-Type = %q, want multipart", got.ContentType)
+		}
+		if !bytes.Equal(got.Media, imageData) {
+			t.Fatalf("media bytes differ: got=%d want=%d", len(got.Media), len(imageData))
+		}
+		var event map[string]any
+		if err := json.Unmarshal(got.Metadata, &event); err != nil {
+			t.Fatalf("metadata JSON: %v", err)
+		}
+		content, _ := event["content"].(map[string]any)
+		if event["version"] != float64(2) || content["type"] != "image" || content["file_name"] != "car.png" {
+			t.Fatalf("metadata event = %s", got.Metadata)
+		}
+		if strings.Contains(string(got.Metadata), "must-not-leak") || strings.Contains(string(got.Metadata), "DOWNLOAD_URL") {
+			t.Fatalf("metadata leaked private media source: %s", got.Metadata)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("multipart image event was not delivered")
+	}
+}
+
+func TestDIVAV2InboundImageFetchFailureFallsBackToDescriptorJSON(t *testing.T) {
+	env := newSendTestEnv(t, false)
+	received := startDIVAMediaWorker(t)
+	msg := &line.Message{
+		ID: "600000000000000202", From: "udriver", To: sendTestGroup, ToType: int(ToGroup),
+		ContentType: int(ContentImage),
+		ContentMetadata: map[string]string{
+			"DOWNLOAD_URL": "/r/official/missing-image",
+			"FILE_NAME":    "missing.png",
+		},
+	}
+	env.lc.handleDIVAInbound(msg, sendTestGroup, "", false, int(OpReceiveMessage), divaOriginLive)
+
+	select {
+	case got := <-received:
+		if got.ContentType != "application/json" {
+			t.Fatalf("Content-Type = %q, want JSON fallback", got.ContentType)
+		}
+		if len(got.Media) != 0 {
+			t.Fatalf("fallback unexpectedly carried %d media bytes", len(got.Media))
+		}
+		var event map[string]any
+		if err := json.Unmarshal(got.Metadata, &event); err != nil {
+			t.Fatalf("fallback JSON: %v", err)
+		}
+		content, _ := event["content"].(map[string]any)
+		if content["type"] != "image" || content["file_name"] != "missing.png" {
+			t.Fatalf("fallback event = %s", got.Metadata)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("descriptor fallback was not delivered")
+	}
+}
+
 // ---------------------------------------------------------------------------
 
 // startDIVAQuietWorker records v2 events and never asks for a reply.
