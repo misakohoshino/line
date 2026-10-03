@@ -78,12 +78,14 @@ type fakeLine struct {
 	contacts       map[string]string
 	contactDelay   time.Duration
 	memberChatMids []string
+	obsDownloads   map[string][]byte
 }
 
 func newFakeLine() *fakeLine {
 	return &fakeLine{
-		mediaFlow: map[string]int{"1": 2, "2": 2, "3": 2, "14": 2},
-		sent:      make(chan struct{}, 16),
+		mediaFlow:    map[string]int{"1": 2, "2": 2, "3": 2, "14": 2},
+		sent:         make(chan struct{}, 16),
+		obsDownloads: map[string][]byte{},
 	}
 }
 
@@ -125,6 +127,12 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 			call.ObsType = params["type"]
 		}
 		f.calls = append(f.calls, call)
+		if req.Method == http.MethodGet {
+			if data, ok := f.obsDownloads[req.URL.Path]; ok {
+				return fakeHTTPResponse(req, http.StatusOK, string(data), nil), nil
+			}
+			return fakeHTTPResponse(req, http.StatusNotFound, "", nil), nil
+		}
 		header := http.Header{}
 		if strings.Contains(req.URL.Path, "/reqid-") {
 			f.oids++
