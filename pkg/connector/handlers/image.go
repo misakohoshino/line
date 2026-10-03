@@ -18,56 +18,14 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	downloadSource := lineImageDownloadSource(data)
-	if downloadSource.publicPath == "" && downloadSource.oid == "" {
-		return nil, nil
-	}
-
-	mediaCategory := lineMediaCategory(data.ContentMetadata)
-	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, downloadSource.isPlainMedia)
-	h.Log.Debug().
-		Str("oid", downloadSource.oid).
-		Str("msg_id", data.ID).
-		Str("tid", downloadOptions.TID).
-		Str("media_category", mediaCategory).
-		Bool("has_obs_pop", downloadOptions.OBSPop != "").
-		Bool("plain_media", downloadSource.isPlainMedia).
-		Bool("public_resource", downloadSource.publicPath != "").
-		Msg("Downloading image from LINE OBS")
-	fetched, err := h.fetchMedia(ctx, mediaFetchRequest{
-		MessageID:  data.ID,
-		OID:        downloadSource.oid,
-		PublicPath: downloadSource.publicPath,
-		SID:        "m",
-		UseSID:     downloadSource.isPlainMedia,
-		Plain:      downloadSource.isPlainMedia,
-		Options:    downloadOptions,
-	})
+	fetched, err := h.FetchImage(ctx, data, decryptedBody)
 	imgData := fetched.Data
 	downloadDuration := fetched.DownloadDuration
-
+	decryptDuration := fetched.DecryptDuration
 	if err != nil {
-		h.Log.Warn().
-			Err(err).
-			Str("oid", downloadSource.oid).
-			Str("msg_id", data.ID).
-			Bool("plain_media", downloadSource.isPlainMedia).
-			Bool("public_resource", downloadSource.publicPath != "").
-			Dur("download_duration", downloadDuration).
-			Msg("Failed to download image from OBS")
-		return mediaDownloadFailure("Image", err, relatesTo)
-	}
-
-	// Decrypt encrypted media before it can reach Matrix.
-	decryptStart := time.Now()
-	imgData, err = h.decryptDownloadedMedia(imgData, decryptedBody, data.ContentMetadata, "image")
-	decryptDuration := time.Since(decryptStart)
-	if err != nil {
-		h.Log.Error().
-			Err(err).
-			Dur("download_duration", downloadDuration).
-			Dur("decrypt_duration", decryptDuration).
-			Msg("Failed to decrypt image data")
+		if !fetched.Downloaded {
+			return mediaDownloadFailure("Image", err, relatesTo)
+		}
 		return nil, err
 	}
 
@@ -117,6 +75,75 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			},
 		},
 	}, nil
+}
+
+// ImageFetchResult is a fully downloaded and, when necessary, decrypted LINE image.
+// OID, key material and encrypted chunks never leave the bridge through this type.
+type ImageFetchResult struct {
+	Data             []byte
+	Downloaded       bool
+	DownloadDuration time.Duration
+	DecryptDuration  time.Duration
+}
+
+// FetchImage is the shared image fetch path used by both Matrix conversion and
+// DIVA inbound media delivery. It preserves LINE's public/plain/E2EE source
+// selection and keeps media decryption inside the bridge.
+func (h *Handler) FetchImage(ctx context.Context, data line.Message, decryptedBody string) (ImageFetchResult, error) {
+	result := ImageFetchResult{}
+	downloadSource := lineImageDownloadSource(data)
+	if downloadSource.publicPath == "" && downloadSource.oid == "" {
+		return result, nil
+	}
+
+	mediaCategory := lineMediaCategory(data.ContentMetadata)
+	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, downloadSource.isPlainMedia)
+	h.Log.Debug().
+		Str("oid", downloadSource.oid).
+		Str("msg_id", data.ID).
+		Str("tid", downloadOptions.TID).
+		Str("media_category", mediaCategory).
+		Bool("has_obs_pop", downloadOptions.OBSPop != "").
+		Bool("plain_media", downloadSource.isPlainMedia).
+		Bool("public_resource", downloadSource.publicPath != "").
+		Msg("Downloading image from LINE OBS")
+
+	fetched, err := h.fetchMedia(ctx, mediaFetchRequest{
+		MessageID:  data.ID,
+		OID:        downloadSource.oid,
+		PublicPath: downloadSource.publicPath,
+		SID:        "m",
+		UseSID:     downloadSource.isPlainMedia,
+		Plain:      downloadSource.isPlainMedia,
+		Options:    downloadOptions,
+	})
+	result.Data = fetched.Data
+	result.DownloadDuration = fetched.DownloadDuration
+	if err != nil {
+		h.Log.Warn().
+			Err(err).
+			Str("oid", downloadSource.oid).
+			Str("msg_id", data.ID).
+			Bool("plain_media", downloadSource.isPlainMedia).
+			Bool("public_resource", downloadSource.publicPath != "").
+			Dur("download_duration", result.DownloadDuration).
+			Msg("Failed to download image from OBS")
+		return result, err
+	}
+	result.Downloaded = true
+
+	decryptStart := time.Now()
+	result.Data, err = h.decryptDownloadedMedia(result.Data, decryptedBody, data.ContentMetadata, "image")
+	result.DecryptDuration = time.Since(decryptStart)
+	if err != nil {
+		h.Log.Error().
+			Err(err).
+			Dur("download_duration", result.DownloadDuration).
+			Dur("decrypt_duration", result.DecryptDuration).
+			Msg("Failed to decrypt image data")
+		return result, err
+	}
+	return result, nil
 }
 
 type imageDownloadSource struct {
