@@ -27,6 +27,16 @@ type mediaFetchResult struct {
 	DownloadDuration time.Duration
 }
 
+// FetchedMedia is fully downloaded media ready for consumers inside the bridge.
+// Data is decrypted by the type-specific Fetch* method before it is returned.
+// OID, key material and encrypted chunks are intentionally not exposed.
+type FetchedMedia struct {
+	Data             []byte
+	Downloaded       bool
+	DownloadDuration time.Duration
+	DecryptDuration  time.Duration
+}
+
 func (h *Handler) fetchMedia(ctx context.Context, req mediaFetchRequest) (mediaFetchResult, error) {
 	result := mediaFetchResult{StartedAt: time.Now()}
 	client := h.NewClient()
