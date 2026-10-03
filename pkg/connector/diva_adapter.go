@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/connector/handlers"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
@@ -217,6 +218,14 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 					logEvent = logEvent.Err(fetchErr)
 				}
 				logEvent.Msg("DIVA image fetch unavailable, forwarding descriptor only")
+				return divaJSONForwardPayload(metadata), nil
+			}
+			if len(fetched.Data) > handlers.BeeperMaxFileSize {
+				lc.UserLogin.Bridge.Log.Warn().
+					Str("message_id", event.Message.ID).
+					Int("size_bytes", len(fetched.Data)).
+					Int("limit_bytes", handlers.BeeperMaxFileSize).
+					Msg("DIVA image exceeds media limit, forwarding descriptor only")
 				return divaJSONForwardPayload(metadata), nil
 			}
 			return divaMultipartForwardPayload(metadata, fetched.Data)
