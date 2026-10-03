@@ -37,6 +37,13 @@ type Handler struct {
 	DecryptMedia func(data []byte, keyMaterial string) ([]byte, error)
 }
 
+// DecryptFetchedMedia applies the existing inbound media decryption rules to
+// bytes returned by FetchMedia. It is exported for the DIVA transport adapter;
+// Matrix handlers still use the same underlying implementation.
+func (h *Handler) DecryptFetchedMedia(data []byte, decryptedBody string, metadata map[string]string, kind MediaKind) ([]byte, error) {
+	return h.decryptDownloadedMedia(data, decryptedBody, metadata, string(kind))
+}
+
 func (h *Handler) decryptDownloadedMedia(data []byte, decryptedBody string, metadata map[string]string, kind string) ([]byte, error) {
 	var bodyKey string
 	var bodyKeyDeclared bool
