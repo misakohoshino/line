@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/connector/handlers"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
@@ -99,14 +100,17 @@ func TestDIVAInboundLiveImageUsesMultipart(t *testing.T) {
 	lc := newDIVAV2TestClient(io.Discard)
 	image := []byte("\x89PNG\r\n\x1a\nimage")
 
-	oldPrepare := divaPrepareImageMedia
-	divaPrepareImageMedia = func(_ *LineClient, _ context.Context, _ line.Message, decryptedBody string) (*divaInboundMedia, error) {
+	oldPrepare := divaPrepareInboundMedia
+	divaPrepareInboundMedia = func(_ *LineClient, _ context.Context, kind handlers.MediaKind, _ line.Message, decryptedBody string) (*divaInboundMedia, error) {
 		if !strings.Contains(decryptedBody, "keyMaterial") {
 			t.Fatalf("decrypted body = %q", decryptedBody)
 		}
-		return &divaInboundMedia{Data: image, MimeType: "image/png"}, nil
+		if kind != handlers.MediaKindImage {
+			t.Fatalf("kind = %q, want image", kind)
+		}
+		return &divaInboundMedia{Data: image, MimeType: "image/png", FileName: "car.png"}, nil
 	}
-	t.Cleanup(func() { divaPrepareImageMedia = oldPrepare })
+	t.Cleanup(func() { divaPrepareInboundMedia = oldPrepare })
 
 	lc.handleDIVAInbound(
 		divaInboundImageMessage("600000000000000201"),
@@ -144,12 +148,12 @@ func TestDIVAInboundBackfillImageStaysDescriptorOnly(t *testing.T) {
 	lc := newDIVAV2TestClient(io.Discard)
 	var prepareCalls atomic.Int32
 
-	oldPrepare := divaPrepareImageMedia
-	divaPrepareImageMedia = func(_ *LineClient, _ context.Context, _ line.Message, _ string) (*divaInboundMedia, error) {
+	oldPrepare := divaPrepareInboundMedia
+	divaPrepareInboundMedia = func(_ *LineClient, _ context.Context, kind handlers.MediaKind, _ line.Message, _ string) (*divaInboundMedia, error) {
 		prepareCalls.Add(1)
-		return &divaInboundMedia{Data: []byte("should-not-happen"), MimeType: "image/png"}, nil
+		return &divaInboundMedia{Data: []byte("should-not-happen"), MimeType: "image/png", FileName: "old.png"}, nil
 	}
-	t.Cleanup(func() { divaPrepareImageMedia = oldPrepare })
+	t.Cleanup(func() { divaPrepareInboundMedia = oldPrepare })
 
 	lc.handleDIVAInbound(
 		divaInboundImageMessage("600000000000000202"),
@@ -178,11 +182,11 @@ func TestDIVAInboundImageMediaFailureFallsBackToJSONOnce(t *testing.T) {
 	logs := &divaSyncBuffer{}
 	lc := newDIVAV2TestClient(logs)
 
-	oldPrepare := divaPrepareImageMedia
-	divaPrepareImageMedia = func(_ *LineClient, _ context.Context, _ line.Message, _ string) (*divaInboundMedia, error) {
+	oldPrepare := divaPrepareInboundMedia
+	divaPrepareInboundMedia = func(_ *LineClient, _ context.Context, kind handlers.MediaKind, _ line.Message, _ string) (*divaInboundMedia, error) {
 		return nil, errors.New("OBS unavailable")
 	}
-	t.Cleanup(func() { divaPrepareImageMedia = oldPrepare })
+	t.Cleanup(func() { divaPrepareInboundMedia = oldPrepare })
 
 	lc.handleDIVAInbound(
 		divaInboundImageMessage("600000000000000203"),
@@ -214,7 +218,7 @@ func TestPrepareDIVAInboundImageRejectsOversizeMetadataBeforeFetch(t *testing.T)
 		ID:              "oversize",
 		ContentMetadata: map[string]string{"FILE_SIZE": "1057"},
 	}
-	media, err := lc.prepareDIVAInboundImage(context.Background(), msg, "")
+	media, err := lc.prepareDIVAInboundMedia(context.Background(), handlers.MediaKindImage, msg, "")
 	if media != nil || err == nil || !strings.Contains(err.Error(), "exceeds DIVA media limit") {
 		t.Fatalf("media=%v err=%v", media, err)
 	}
