@@ -205,7 +205,7 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 			if err != nil {
 				return divaForwardPayload{}, err
 			}
-			if ContentType(msgCopy.ContentType) != ContentImage {
+			if ContentType(msgCopy.ContentType) != ContentImage || origin != divaOriginLive {
 				return divaJSONForwardPayload(metadata), nil
 			}
 
