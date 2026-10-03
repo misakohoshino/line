@@ -462,6 +462,41 @@ func TestDIVAV2InboundImageUsesMultipartBinary(t *testing.T) {
 	}
 }
 
+func TestDIVAV2BackfillImageStaysDescriptorOnly(t *testing.T) {
+	env := newSendTestEnv(t, false)
+	received := startDIVAMediaWorker(t)
+	imageData := testPNG(t)
+	const downloadPath = "/r/official/backfill-image-must-not-fetch"
+	env.fake.obsDownloads[downloadPath] = imageData
+
+	msg := &line.Message{
+		ID: "600000000000000203", From: "udriver", To: sendTestGroup, ToType: int(ToGroup),
+		ContentType: int(ContentImage),
+		ContentMetadata: map[string]string{
+			"DOWNLOAD_URL": downloadPath,
+			"FILE_NAME":    "old.png",
+		},
+	}
+	env.lc.handleDIVAInbound(msg, sendTestGroup, "", false, int(OpReceiveMessage), divaOriginBackfill)
+
+	select {
+	case got := <-received:
+		if got.ContentType != "application/json" {
+			t.Fatalf("backfill Content-Type = %q, want JSON descriptor", got.ContentType)
+		}
+		if len(got.Media) != 0 {
+			t.Fatalf("backfill unexpectedly carried %d media bytes", len(got.Media))
+		}
+		for _, method := range env.fake.methods() {
+			if strings.HasPrefix(method, "OBS ") {
+				t.Fatalf("backfill image fetched OBS: %v", env.fake.methods())
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("backfill image descriptor was not delivered")
+	}
+}
+
 func TestDIVAV2InboundImageFetchFailureFallsBackToDescriptorJSON(t *testing.T) {
 	env := newSendTestEnv(t, false)
 	received := startDIVAMediaWorker(t)
