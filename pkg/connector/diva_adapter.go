@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
@@ -16,11 +17,54 @@ import (
 )
 
 const (
-	defaultDIVAWebhookTimeout = 2 * time.Second
-	defaultDIVASendTimeout    = 10 * time.Second
+	defaultDIVAWebhookTimeout      = 2 * time.Second
+	defaultDIVAMediaWebhookTimeout = 2 * time.Minute
+	defaultDIVASendTimeout         = 10 * time.Second
 )
 
-var divaHTTPClient = &http.Client{Timeout: defaultDIVAWebhookTimeout}
+var (
+	divaHTTPClient      = &http.Client{Timeout: defaultDIVAWebhookTimeout}
+	divaMediaHTTPClient = &http.Client{Timeout: defaultDIVAMediaWebhookTimeout}
+)
+
+type divaForwardPayload struct {
+	Body        []byte
+	ContentType string
+	Media       bool
+}
+
+func divaJSONForwardPayload(body []byte) divaForwardPayload {
+	return divaForwardPayload{Body: body, ContentType: "application/json"}
+}
+
+func divaMultipartForwardPayload(metadata, media []byte) (divaForwardPayload, error) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	metadataPart, err := writer.CreateFormField("metadata")
+	if err != nil {
+		return divaForwardPayload{}, err
+	}
+	if _, err = metadataPart.Write(metadata); err != nil {
+		return divaForwardPayload{}, err
+	}
+	// Remote file names stay inside the JSON metadata. A fixed multipart name
+	// avoids treating LINE-provided text as a MIME header value.
+	mediaPart, err := writer.CreateFormFile("media", "image.bin")
+	if err != nil {
+		return divaForwardPayload{}, err
+	}
+	if _, err = mediaPart.Write(media); err != nil {
+		return divaForwardPayload{}, err
+	}
+	if err = writer.Close(); err != nil {
+		return divaForwardPayload{}, err
+	}
+	return divaForwardPayload{
+		Body:        body.Bytes(),
+		ContentType: writer.FormDataContentType(),
+		Media:       true,
+	}, nil
+}
 
 type divaInboundEvent struct {
 	Text      string `json:"text"`
@@ -133,12 +177,20 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 	}
 
 	// The event is built here, while msg is still owned by the receive loop.
-	// Only the sender name lookup and the encoding run in the forward goroutine.
-	var encode func() ([]byte, error)
+	// Only sender-name lookup, media fetch and encoding run in the forward
+	// goroutine. Clone metadata before leaving the receive loop.
+	var encode func() (divaForwardPayload, error)
 	if version == divaContractV2 {
 		event := lc.buildDIVAV2Event(msg, chatMID, unwrappedText, decryptionFailed, opType, origin)
 		lookupName := event.Sender.DisplayName == nil && origin == divaOriginLive && !event.Sender.IsFromMe
-		encode = func() ([]byte, error) {
+		msgCopy := *msg
+		if msg.ContentMetadata != nil {
+			msgCopy.ContentMetadata = make(map[string]string, len(msg.ContentMetadata))
+			for key, value := range msg.ContentMetadata {
+				msgCopy.ContentMetadata[key] = value
+			}
+		}
+		encode = func() (divaForwardPayload, error) {
 			if lookupName {
 				event.Sender.DisplayName = lc.lookupDIVADisplayName(event.Sender.Mid)
 				lc.UserLogin.Bridge.Log.Debug().
@@ -148,7 +200,26 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 					Bool("found", event.Sender.DisplayName != nil).
 					Msg("[DIVA_NAME] display name lookup for uncached sender")
 			}
-			return json.Marshal(event)
+			metadata, err := json.Marshal(event)
+			if err != nil {
+				return divaForwardPayload{}, err
+			}
+			if ContentType(msgCopy.ContentType) != ContentImage {
+				return divaJSONForwardPayload(metadata), nil
+			}
+
+			fetched, fetchErr := lc.newMessageHandler().FetchImage(context.Background(), msgCopy, unwrappedText)
+			if fetchErr != nil || len(fetched.Data) == 0 {
+				logEvent := lc.UserLogin.Bridge.Log.Warn().
+					Str("message_id", event.Message.ID).
+					Int("content_type", msgCopy.ContentType)
+				if fetchErr != nil {
+					logEvent = logEvent.Err(fetchErr)
+				}
+				logEvent.Msg("DIVA image fetch unavailable, forwarding descriptor only")
+				return divaJSONForwardPayload(metadata), nil
+			}
+			return divaMultipartForwardPayload(metadata, fetched.Data)
 		}
 	} else {
 		event := divaInboundEvent{
@@ -157,7 +228,10 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 			SenderID:  msg.From,
 			MessageID: msg.ID,
 		}
-		encode = func() ([]byte, error) { return json.Marshal(event) }
+		encode = func() (divaForwardPayload, error) {
+			body, err := json.Marshal(event)
+			return divaJSONForwardPayload(body), err
+		}
 	}
 	lc.forwardDIVAInbound(encode, chatMID, msg.ID, origin == divaOriginLive)
 }
@@ -168,7 +242,7 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 // returns reply_text and allowReply is set, Go sends that text back to the
 // same LINE chat. Backfilled events never get a reply, whatever the worker
 // answers.
-func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), groupID, messageID string, allowReply bool) {
+func (lc *LineClient) forwardDIVAInbound(encode func() (divaForwardPayload, error), groupID, messageID string, allowReply bool) {
 	endpoint := strings.TrimSpace(os.Getenv("DIVA_WEBHOOK_URL"))
 	if endpoint == "" {
 		return
@@ -181,17 +255,23 @@ func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), groupID,
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), defaultDIVAWebhookTimeout)
+		timeout := defaultDIVAWebhookTimeout
+		client := divaHTTPClient
+		if payload.Media {
+			timeout = defaultDIVAMediaWebhookTimeout
+			client = divaMediaHTTPClient
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload.Body))
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("DIVA adapter failed to build request")
 			return
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", payload.ContentType)
 
-		resp, err := divaHTTPClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("message_id", messageID).Msg("DIVA adapter delivery failed")
 			return
