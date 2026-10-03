@@ -133,6 +133,7 @@ type divaSendMediaMetadata struct {
 	MessageType string `json:"message_type"`
 	FileName    string `json:"file_name,omitempty"`
 	MimeType    string `json:"mime_type,omitempty"`
+	DurationMS  *int   `json:"duration_ms,omitempty"`
 	Relations   *struct {
 		ReplyTo *struct {
 			MessageID string `json:"message_id"`
@@ -149,6 +150,9 @@ const (
 	divaReplyFallbackDrop   = "send_without_reply"
 	divaMessageTypeText     = "text"
 	divaMessageTypeImage    = "image"
+	divaMessageTypeVideo    = "video"
+	divaMessageTypeAudio    = "audio"
+	divaMessageTypeFile     = "file"
 	divaSendContractVersion = 1
 )
 
@@ -280,7 +284,7 @@ func parseDIVASendRequest(body []byte) (*divaSendRequest, *divaSendJob, *divaReq
 	return &raw, job, nil
 }
 
-// parseDIVASendMediaMetadata validates the metadata and image bytes and builds
+// parseDIVASendMediaMetadata validates media metadata/binary and builds
 // the same send job used by /diva/v1/send. It never touches LINE.
 func parseDIVASendMediaMetadata(raw divaSendMediaMetadata, data []byte, multipartFileName string) (*divaSendJob, *divaRequestError) {
 	if raw.Version == nil || *raw.Version != divaSendContractVersion {
@@ -299,29 +303,67 @@ func parseDIVASendMediaMetadata(raw divaSendMediaMetadata, data []byte, multipar
 			return nil, invalidRequest("target.account_mid must be a LINE user MID or null")
 		}
 	}
-	if raw.MessageType != divaMessageTypeImage {
-		return nil, &divaRequestError{
-			status: http.StatusBadRequest,
-			code:   outboundUnsupportedMessageType,
-			detail: fmt.Sprintf("message_type %q is not supported by /diva/v1/send-media; only %q", raw.MessageType, divaMessageTypeImage),
-		}
-	}
 	if len(data) == 0 {
 		return nil, invalidRequest("media must not be empty")
 	}
-	detectedMIME := http.DetectContentType(data)
-	switch detectedMIME {
-	case "image/jpeg", "image/png", "image/gif":
+
+	contentType := ContentImage
+	mimeType := strings.TrimSpace(raw.MimeType)
+	switch raw.MessageType {
+	case divaMessageTypeImage:
+		detectedMIME := http.DetectContentType(data)
+		switch detectedMIME {
+		case "image/jpeg", "image/png", "image/gif":
+		default:
+			return nil, invalidRequest("media is not a supported image (JPEG, PNG or GIF)")
+		}
+		if mimeType != "" && mimeType != detectedMIME {
+			return nil, invalidRequest("mime_type %q does not match detected media type %q", mimeType, detectedMIME)
+		}
+		if mimeType == "" {
+			mimeType = detectedMIME
+		}
+		contentType = ContentImage
+	case divaMessageTypeVideo:
+		if mimeType == "" {
+			mimeType = "video/mp4"
+		}
+		if !strings.HasPrefix(strings.ToLower(mimeType), "video/") {
+			return nil, invalidRequest("video mime_type must begin with video/")
+		}
+		contentType = ContentVideo
+	case divaMessageTypeAudio:
+		if mimeType == "" {
+			mimeType = "audio/mp4"
+		}
+		if !strings.HasPrefix(strings.ToLower(mimeType), "audio/") {
+			return nil, invalidRequest("audio mime_type must begin with audio/")
+		}
+		contentType = ContentAudio
+	case divaMessageTypeFile:
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		contentType = ContentFile
 	default:
-		return nil, invalidRequest("media is not a supported image (JPEG, PNG or GIF)")
+		return nil, &divaRequestError{
+			status: http.StatusBadRequest,
+			code:   outboundUnsupportedMessageType,
+			detail: fmt.Sprintf("message_type %q is not supported by /diva/v1/send-media", raw.MessageType),
+		}
 	}
-	if raw.MimeType != "" && raw.MimeType != detectedMIME {
-		return nil, invalidRequest("mime_type %q does not match detected media type %q", raw.MimeType, detectedMIME)
+
+	duration := 0
+	if raw.DurationMS != nil {
+		if *raw.DurationMS < 0 {
+			return nil, invalidRequest("duration_ms must be >= 0")
+		}
+		if contentType != ContentVideo && contentType != ContentAudio {
+			return nil, invalidRequest("duration_ms is only valid for video or audio")
+		}
+		duration = *raw.DurationMS
 	}
-	mimeType := raw.MimeType
-	if mimeType == "" {
-		mimeType = detectedMIME
-	}
+
 	fileName := strings.TrimSpace(raw.FileName)
 	if fileName == "" {
 		fileName = strings.TrimSpace(multipartFileName)
@@ -358,17 +400,18 @@ func parseDIVASendMediaMetadata(raw divaSendMediaMetadata, data []byte, multipar
 		wait:       wait,
 		req: &lineOutboundRequest{
 			ChatMID:       raw.Target.ChatID,
-			ContentType:   ContentImage,
-			Media:         &outboundMedia{Data: data, MimeType: mimeType, FileName: fileName},
+			ContentType:   contentType,
+			Media:         &outboundMedia{Data: data, MimeType: mimeType, FileName: fileName, Duration: duration},
 			ReplyToID:     replyTo,
 			ReplyFallback: replyFallback == divaReplyFallbackDrop,
 		},
 	}
 	fp, _ := json.Marshal(struct {
 		AccountMID, ChatID, MessageType, FileName, MimeType, ReplyTo, ReplyFallback string
+		DurationMS                                                                  int
 		MediaSHA256                                                                 [32]byte
 	}{
-		accountMID, raw.Target.ChatID, raw.MessageType, fileName, mimeType, replyTo, replyFallback, mediaHash,
+		accountMID, raw.Target.ChatID, raw.MessageType, fileName, mimeType, replyTo, replyFallback, duration, mediaHash,
 	})
 	job.fingerprint = sha256.Sum256(fp)
 	return job, nil

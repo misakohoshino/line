@@ -2,6 +2,7 @@ package line
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -146,5 +147,29 @@ func TestNoUsableE2EEGroupKeyTalkExceptionExceedMaxMember(t *testing.T) {
 		Reason: "exceed max member",
 	}) {
 		t.Fatal("expected structured exceed max member response to disable group E2EE")
+	}
+}
+
+func TestIsMemberSettingsOffError(t *testing.T) {
+	memberOff := errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":98,"reason":"member settings off","parameterMap":{}}}`)
+	if !IsMemberSettingsOffError(memberOff) {
+		t.Fatal("expected code 98 member settings off to be detected")
+	}
+	if !IsMemberSettingsOffError(fmt.Errorf("sendMessage: %w", memberOff)) {
+		t.Fatal("expected wrapped code 98 member settings off to be detected")
+	}
+
+	for name, err := range map[string]error{
+		"nil":               nil,
+		"other code 98":     errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":98,"reason":"different reason"}}`),
+		"phrase outside":    errors.New(`API error 400: {"code":10051,"message":"member settings off","data":{"name":"TalkException","code":98,"reason":"different reason"}}`),
+		"code 5 not found":  errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":5,"reason":"not found"}}`),
+		"code 119 refresh":  errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":119,"reason":"Access token refresh required"}}`),
+		"no response error": errors.New(`code 98 member settings off`),
+		"server error":      errors.New(`API error 502: bad gateway`),
+	} {
+		if IsMemberSettingsOffError(err) {
+			t.Fatalf("%s must not be treated as member settings off", name)
+		}
 	}
 }
