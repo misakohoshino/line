@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
@@ -12,67 +13,75 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
-// ConvertFile converts a LINE file message to a Matrix file message.
-func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
-	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
-		return oversized, nil
-	}
+type FetchedFile struct {
+	FetchedMedia
+	FileName string
+}
 
+// FetchFile downloads and decrypts a LINE file using the existing emf/m SID
+// rules and resolves the E2EE fileName payload inside the bridge.
+func (h *Handler) FetchFile(ctx context.Context, data line.Message, decryptedBody string) (FetchedFile, error) {
+	result := FetchedFile{}
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
-
 	if oid == "" && decryptedBody != "" && strings.Contains(decryptedBody, "fileName") {
 		h.Log.Debug().Msg("File message with encrypted payload, OID in metadata")
 	}
-
-	// For plain media, the file is stored at r/talk/m/{messageID}
 	if isPlainMedia {
 		oid = data.ID
 	}
-
 	if oid == "" {
-		return nil, nil
+		return result, nil
 	}
-
 	sid := "emf"
 	if isPlainMedia {
 		sid = "m"
 	}
-	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
 	fetched, err := h.fetchMedia(ctx, mediaFetchRequest{
-		MessageID: data.ID,
-		OID:       oid,
-		SID:       sid,
-		UseSID:    true,
-		Plain:     isPlainMedia,
-		Options:   downloadOptions,
+		MessageID: data.ID, OID: oid, SID: sid, UseSID: true, Plain: isPlainMedia,
+		Options: lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia),
 	})
-	fileData := fetched.Data
-
+	result.Data = fetched.Data
+	result.DownloadDuration = fetched.DownloadDuration
 	if err != nil {
-		h.Log.Warn().
-			Err(err).
-			Str("oid", oid).
-			Bool("plain_media", isPlainMedia).
+		h.Log.Warn().Err(err).Str("oid", oid).Bool("plain_media", isPlainMedia).
 			Msg("Failed to download file from OBS")
-		return mediaDownloadFailure("File", err, relatesTo)
+		return result, err
 	}
-
-	var fileName string
+	result.Downloaded = true
 	if strings.Contains(decryptedBody, "fileName") {
 		var fileInfo struct {
 			FileName string `json:"fileName"`
 		}
 		if err := json.Unmarshal([]byte(decryptedBody), &fileInfo); err != nil {
 			h.Log.Error().Err(err).Msg("Failed to parse file payload JSON")
-			return nil, fmt.Errorf("failed to parse file payload: %w", err)
+			return result, fmt.Errorf("failed to parse file payload: %w", err)
 		}
-		fileName = fileInfo.FileName
+		result.FileName = fileInfo.FileName
 	}
-
-	fileData, err = h.decryptDownloadedMedia(fileData, decryptedBody, data.ContentMetadata, "file")
+	decryptStart := time.Now()
+	result.Data, err = h.decryptDownloadedMedia(result.Data, decryptedBody, data.ContentMetadata, "file")
+	result.DecryptDuration = time.Since(decryptStart)
 	if err != nil {
 		h.Log.Error().Err(err).Msg("Failed to decrypt file data")
+		return result, err
+	}
+	return result, nil
+}
+
+// ConvertFile converts a LINE file message to a Matrix file message.
+func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
+		return oversized, nil
+	}
+
+	fetched, err := h.FetchFile(ctx, data, decryptedBody)
+	fileData := fetched.Data
+	fileName := fetched.FileName
+	if err != nil {
+		if !fetched.Downloaded {
+			return mediaDownloadFailure("File", err, relatesTo)
+		}
 		return nil, err
 	}
 
