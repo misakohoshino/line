@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -50,12 +51,13 @@ type divaInboundDecision struct {
 type divaInboundMedia struct {
 	Data     []byte
 	MimeType string
+	FileName string
 }
 
 type divaInboundMediaLoader func(context.Context) (*divaInboundMedia, error)
 
-var divaPrepareImageMedia = func(lc *LineClient, ctx context.Context, msg line.Message, decryptedBody string) (*divaInboundMedia, error) {
-	return lc.prepareDIVAInboundImage(ctx, msg, decryptedBody)
+var divaPrepareInboundMedia = func(lc *LineClient, ctx context.Context, kind handlers.MediaKind, msg line.Message, decryptedBody string) (*divaInboundMedia, error) {
+	return lc.prepareDIVAInboundMedia(ctx, kind, msg, decryptedBody)
 }
 
 func divaInboundMediaMaxBytes() int64 {
@@ -70,7 +72,7 @@ func divaInboundMediaMaxBytes() int64 {
 	return parsed
 }
 
-func cloneDIVAImageMessage(msg *line.Message) line.Message {
+func cloneDIVAMediaMessage(msg *line.Message) line.Message {
 	copyMsg := line.Message{ID: msg.ID}
 	if len(msg.ContentMetadata) > 0 {
 		copyMsg.ContentMetadata = make(map[string]string, len(msg.ContentMetadata))
@@ -81,42 +83,139 @@ func cloneDIVAImageMessage(msg *line.Message) line.Message {
 	return copyMsg
 }
 
-func (lc *LineClient) prepareDIVAInboundImage(ctx context.Context, msg line.Message, decryptedBody string) (*divaInboundMedia, error) {
+func divaMediaKindForContentType(contentType ContentType) (handlers.MediaKind, bool) {
+	switch contentType {
+	case ContentImage:
+		return handlers.MediaKindImage, true
+	case ContentVideo:
+		return handlers.MediaKindVideo, true
+	case ContentAudio:
+		return handlers.MediaKindAudio, true
+	case ContentFile:
+		return handlers.MediaKindFile, true
+	default:
+		return "", false
+	}
+}
+
+func divaMediaFileName(kind handlers.MediaKind, msg line.Message, decryptedBody, mimeType string) (string, error) {
+	name := strings.TrimSpace(msg.ContentMetadata["FILE_NAME"])
+	switch kind {
+	case handlers.MediaKindImage:
+		if name != "" {
+			return name, nil
+		}
+		switch mimeType {
+		case "image/png":
+			return "image.png", nil
+		case "image/gif":
+			return "image.gif", nil
+		default:
+			return "image.jpg", nil
+		}
+	case handlers.MediaKindVideo:
+		if name == "" && strings.Contains(decryptedBody, "fileName") {
+			var payload struct {
+				FileName string `json:"fileName"`
+			}
+			if err := json.Unmarshal([]byte(decryptedBody), &payload); err == nil {
+				name = strings.TrimSpace(payload.FileName)
+			}
+		}
+		if name == "" {
+			name = "video.mp4"
+		}
+		return name, nil
+	case handlers.MediaKindAudio:
+		return "audio.m4a", nil
+	case handlers.MediaKindFile:
+		if strings.Contains(decryptedBody, "fileName") {
+			var payload struct {
+				FileName string `json:"fileName"`
+			}
+			if err := json.Unmarshal([]byte(decryptedBody), &payload); err != nil {
+				return "", fmt.Errorf("failed to parse file payload JSON: %w", err)
+			}
+			name = strings.TrimSpace(payload.FileName)
+		}
+		if name == "" {
+			name = "file.bin"
+		}
+		return name, nil
+	default:
+		return "", fmt.Errorf("unsupported DIVA inbound media kind %q", kind)
+	}
+}
+
+func divaMediaMimeType(kind handlers.MediaKind, media []byte, fileName string) (string, error) {
+	switch kind {
+	case handlers.MediaKindImage:
+		detected := http.DetectContentType(media)
+		switch detected {
+		case "image/jpeg", "image/png", "image/gif":
+			return detected, nil
+		default:
+			return "", fmt.Errorf("LINE image has unsupported media type %q", detected)
+		}
+	case handlers.MediaKindVideo:
+		if strings.HasSuffix(strings.ToLower(fileName), ".webm") {
+			return "video/webm", nil
+		}
+		return "video/mp4", nil
+	case handlers.MediaKindAudio:
+		return "audio/mp4", nil
+	case handlers.MediaKindFile:
+		if strings.HasSuffix(strings.ToLower(fileName), ".pdf") {
+			return "application/pdf", nil
+		}
+		return "application/octet-stream", nil
+	default:
+		return "", fmt.Errorf("unsupported DIVA inbound media kind %q", kind)
+	}
+}
+
+func (lc *LineClient) prepareDIVAInboundMedia(ctx context.Context, kind handlers.MediaKind, msg line.Message, decryptedBody string) (*divaInboundMedia, error) {
 	maxBytes := divaInboundMediaMaxBytes()
 	if rawSize := strings.TrimSpace(msg.ContentMetadata["FILE_SIZE"]); rawSize != "" {
 		if size, err := strconv.ParseInt(rawSize, 10, 64); err == nil && size > maxBytes+divaEncryptedMediaOverhead {
-			return nil, fmt.Errorf("LINE image metadata size %d exceeds DIVA media limit %d", size, maxBytes)
+			return nil, fmt.Errorf("LINE %s metadata size %d exceeds DIVA media limit %d", kind, size, maxBytes)
 		}
 	}
 
 	h := lc.newMessageHandler()
-	fetched, err := h.FetchMedia(ctx, handlers.MediaKindImage, msg, decryptedBody)
+	fetched, err := h.FetchMedia(ctx, kind, msg, decryptedBody)
 	if err != nil {
 		return nil, err
 	}
 	if fetched == nil {
-		return nil, fmt.Errorf("LINE image has no fetchable media source")
+		return nil, fmt.Errorf("LINE %s has no fetchable media source", kind)
 	}
 	if int64(len(fetched.Data)) > maxBytes+divaEncryptedMediaOverhead {
-		return nil, fmt.Errorf("LINE image download size %d exceeds DIVA media limit %d", len(fetched.Data), maxBytes)
+		return nil, fmt.Errorf("LINE %s download size %d exceeds DIVA media limit %d", kind, len(fetched.Data), maxBytes)
 	}
-	imageData, err := h.DecryptFetchedMedia(fetched.Data, decryptedBody, msg.ContentMetadata, handlers.MediaKindImage)
+	mediaData, err := h.DecryptFetchedMedia(fetched.Data, decryptedBody, msg.ContentMetadata, kind)
 	if err != nil {
 		return nil, err
 	}
-	if len(imageData) == 0 {
-		return nil, fmt.Errorf("LINE image decrypted to empty media")
+	if len(mediaData) == 0 {
+		return nil, fmt.Errorf("LINE %s decrypted to empty media", kind)
 	}
-	if int64(len(imageData)) > maxBytes {
-		return nil, fmt.Errorf("LINE image size %d exceeds DIVA media limit %d", len(imageData), maxBytes)
+	if int64(len(mediaData)) > maxBytes {
+		return nil, fmt.Errorf("LINE %s size %d exceeds DIVA media limit %d", kind, len(mediaData), maxBytes)
 	}
-	mimeType := http.DetectContentType(imageData)
-	switch mimeType {
-	case "image/jpeg", "image/png", "image/gif":
-	default:
-		return nil, fmt.Errorf("LINE image has unsupported media type %q", mimeType)
+	preliminaryName, err := divaMediaFileName(kind, msg, decryptedBody, "")
+	if err != nil {
+		return nil, err
 	}
-	return &divaInboundMedia{Data: imageData, MimeType: mimeType}, nil
+	mimeType, err := divaMediaMimeType(kind, mediaData, preliminaryName)
+	if err != nil {
+		return nil, err
+	}
+	fileName, err := divaMediaFileName(kind, msg, decryptedBody, mimeType)
+	if err != nil {
+		return nil, err
+	}
+	return &divaInboundMedia{Data: mediaData, MimeType: mimeType, FileName: fileName}, nil
 }
 
 func buildDIVAInboundMultipart(metadata []byte, media *divaInboundMedia) ([]byte, string, error) {
@@ -138,7 +237,13 @@ func buildDIVAInboundMultipart(metadata []byte, media *divaInboundMedia) ([]byte
 	}
 
 	mediaHeader := make(textproto.MIMEHeader)
-	mediaHeader.Set("Content-Disposition", `form-data; name="media"; filename="image.bin"`)
+	fileName := strings.TrimSpace(media.FileName)
+	if fileName == "" {
+		fileName = "media.bin"
+	}
+	mediaHeader.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{
+		"name": "media", "filename": fileName,
+	}))
 	mediaHeader.Set("Content-Type", media.MimeType)
 	mediaPart, err := writer.CreatePart(mediaHeader)
 	if err != nil {
@@ -255,12 +360,12 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 	// owned by the receive loop. Slow name lookup / OBS fetch / HTTP delivery
 	// stay in the forward goroutine and never block LINE receive.
 	var mediaLoader divaInboundMediaLoader
-	if version == divaContractV2 && origin == divaOriginLive &&
-		ContentType(msg.ContentType) == ContentImage && !decryptionFailed {
-		imageMsg := cloneDIVAImageMessage(msg)
+	if mediaKind, supported := divaMediaKindForContentType(ContentType(msg.ContentType)); version == divaContractV2 &&
+		origin == divaOriginLive && supported && !decryptionFailed {
+		mediaMsg := cloneDIVAMediaMessage(msg)
 		decryptedBody := unwrappedText
 		mediaLoader = func(ctx context.Context) (*divaInboundMedia, error) {
-			return divaPrepareImageMedia(lc, ctx, imageMsg, decryptedBody)
+			return divaPrepareInboundMedia(lc, ctx, mediaKind, mediaMsg, decryptedBody)
 		}
 	}
 
@@ -337,13 +442,13 @@ func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), mediaLoa
 					// event or make LINE receive depend on OBS availability.
 					lc.UserLogin.Bridge.Log.Warn().Err(mediaErr).
 						Str("message_id", messageID).
-						Msg("DIVA inbound image media unavailable; sending descriptor only")
+						Msg("DIVA inbound media unavailable; sending descriptor only")
 				} else if media != nil {
 					multipartBody, multipartType, buildErr := buildDIVAInboundMultipart(payload, media)
 					if buildErr != nil {
 						lc.UserLogin.Bridge.Log.Warn().Err(buildErr).
 							Str("message_id", messageID).
-							Msg("DIVA inbound image multipart build failed; sending descriptor only")
+							Msg("DIVA inbound media multipart build failed; sending descriptor only")
 					} else {
 						requestBody = multipartBody
 						contentType = multipartType
