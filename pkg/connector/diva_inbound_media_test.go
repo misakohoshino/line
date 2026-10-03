@@ -314,6 +314,12 @@ func TestDIVAMediaFileNameAndMIMEFollowExistingHandlerRules(t *testing.T) {
 		t.Fatalf("video MIME=%q err=%v", mimeType, err)
 	}
 
+	fileWithMetadata := line.Message{ContentMetadata: map[string]string{"FILE_NAME": "metadata.pdf"}}
+	fallbackName, fallbackErr := divaMediaFileName(handlers.MediaKindFile, fileWithMetadata, `{"fileName":""}`, "")
+	if fallbackErr != nil || fallbackName != "metadata.pdf" {
+		t.Fatalf("file metadata fallback name=%q err=%v", fallbackName, fallbackErr)
+	}
+
 	file := line.Message{ContentMetadata: map[string]string{}}
 	name, err = divaMediaFileName(handlers.MediaKindFile, file, `{"fileName":"report.pdf"}`, "")
 	if err != nil || name != "report.pdf" {
