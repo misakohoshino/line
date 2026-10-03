@@ -128,6 +128,13 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		f.calls = append(f.calls, call)
 		if req.Method == http.MethodGet {
+			if strings.HasSuffix(req.URL.Path, "/object_info.obs") {
+				base := strings.TrimSuffix(req.URL.Path, "/object_info.obs")
+				if _, ok := f.obsDownloads[base]; ok {
+					return fakeHTTPResponse(req, http.StatusOK, `{"status":"exist","encodeStatus":"done"}`, nil), nil
+				}
+				return fakeHTTPResponse(req, http.StatusOK, `{"status":"notexist","encodeStatus":""}`, nil), nil
+			}
 			if data, ok := f.obsDownloads[req.URL.Path]; ok {
 				return fakeHTTPResponse(req, http.StatusOK, string(data), nil), nil
 			}
