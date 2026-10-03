@@ -157,7 +157,7 @@ func (f *fakeLine) RoundTrip(req *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(req, 200, string(data), nil), nil
 	case "getAllChatMids":
 		data, _ := json.Marshal(map[string]any{
-			"code": 0,
+			"code":    0,
 			"message": "",
 			"data": map[string]any{
 				"memberChatMids":  append([]string(nil), f.memberChatMids...),
