@@ -25,12 +25,14 @@ const (
 	defaultDIVAMediaWebhookTimeout = 2 * time.Minute
 	defaultDIVASendTimeout         = 10 * time.Second
 	defaultDIVAInboundMediaMax     = 32 << 20
+	divaInboundMediaMaxConcurrent  = 2
 	divaEncryptedMediaOverhead     = 32
 )
 
 var (
-	divaHTTPClient      = &http.Client{Timeout: defaultDIVAWebhookTimeout}
-	divaMediaHTTPClient = &http.Client{Timeout: defaultDIVAMediaWebhookTimeout}
+	divaHTTPClient       = &http.Client{Timeout: defaultDIVAWebhookTimeout}
+	divaMediaHTTPClient  = &http.Client{Timeout: defaultDIVAMediaWebhookTimeout}
+	divaInboundMediaSem  = make(chan struct{}, divaInboundMediaMaxConcurrent)
 )
 
 type divaInboundEvent struct {
@@ -315,10 +317,22 @@ func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), mediaLoa
 		requestTimeout := defaultDIVAWebhookTimeout
 
 		if mediaLoader != nil {
-			mediaCtx, mediaCancel := context.WithTimeout(context.Background(), defaultDIVAMediaWebhookTimeout)
-			media, mediaErr := mediaLoader(mediaCtx)
-			mediaCancel()
-			if mediaErr != nil {
+			mediaSlot := false
+			select {
+			case divaInboundMediaSem <- struct{}{}:
+				mediaSlot = true
+			default:
+				lc.UserLogin.Bridge.Log.Warn().
+					Str("message_id", messageID).
+					Int("max_concurrent", divaInboundMediaMaxConcurrent).
+					Msg("DIVA inbound media concurrency full; sending descriptor only")
+			}
+			if mediaSlot {
+				defer func() { <-divaInboundMediaSem }()
+				mediaCtx, mediaCancel := context.WithTimeout(context.Background(), defaultDIVAMediaWebhookTimeout)
+				media, mediaErr := mediaLoader(mediaCtx)
+				mediaCancel()
+				if mediaErr != nil {
 				// Descriptor JSON is still useful. Media failure must not delete the
 				// event or make LINE receive depend on OBS availability.
 				lc.UserLogin.Bridge.Log.Warn().Err(mediaErr).
@@ -335,6 +349,7 @@ func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), mediaLoa
 					contentType = multipartType
 					httpClient = divaMediaHTTPClient
 					requestTimeout = defaultDIVAMediaWebhookTimeout
+				}
 				}
 			}
 		}
