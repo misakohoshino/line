@@ -2,6 +2,7 @@ package connector
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
