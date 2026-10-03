@@ -462,6 +462,64 @@ func TestDIVAV2InboundImageUsesMultipartBinary(t *testing.T) {
 	}
 }
 
+func TestDIVAV2InboundVideoAudioFileUseMultipartBinary(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType ContentType
+		fileName    string
+		duration    string
+		data        []byte
+	}{
+		{name: "video", contentType: ContentVideo, fileName: "clip.mp4", duration: "3000", data: []byte("fake-mp4-binary")},
+		{name: "audio", contentType: ContentAudio, fileName: "voice.m4a", duration: "4200", data: []byte("fake-m4a-binary")},
+		{name: "file", contentType: ContentFile, fileName: "report.pdf", data: []byte("%PDF-fake-binary")},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newSendTestEnv(t, false)
+			received := startDIVAMediaWorker(t)
+			messageID := fmt.Sprintf("6000000000000003%02d", i)
+			downloadPath := "/r/talk/m/" + messageID
+			env.fake.obsDownloads[downloadPath] = tc.data
+			meta := map[string]string{
+				"FILE_NAME": tc.fileName,
+				"FILE_SIZE": fmt.Sprint(len(tc.data)),
+			}
+			if tc.duration != "" {
+				meta["DURATION"] = tc.duration
+			}
+			msg := &line.Message{
+				ID: messageID, From: "udriver", To: sendTestGroup, ToType: int(ToGroup),
+				ContentType: int(tc.contentType), ContentMetadata: meta,
+			}
+			env.lc.handleDIVAInbound(msg, sendTestGroup, "", false, int(OpReceiveMessage), divaOriginLive)
+
+			select {
+			case got := <-received:
+				if !strings.HasPrefix(got.ContentType, "multipart/form-data;") {
+					t.Fatalf("Content-Type = %q, want multipart", got.ContentType)
+				}
+				if !bytes.Equal(got.Media, tc.data) {
+					t.Fatalf("media = %q, want %q", got.Media, tc.data)
+				}
+				var event map[string]any
+				if err := json.Unmarshal(got.Metadata, &event); err != nil {
+					t.Fatalf("metadata JSON: %v", err)
+				}
+				content, _ := event["content"].(map[string]any)
+				if content["type"] != tc.name || content["file_name"] != tc.fileName {
+					t.Fatalf("metadata content = %v", content)
+				}
+				if strings.Contains(string(got.Metadata), "OID") || strings.Contains(string(got.Metadata), "keyMaterial") {
+					t.Fatalf("private media source leaked: %s", got.Metadata)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("%s multipart event not delivered", tc.name)
+			}
+		})
+	}
+}
+
 func TestDIVAV2BackfillImageStaysDescriptorOnly(t *testing.T) {
 	env := newSendTestEnv(t, false)
 	received := startDIVAMediaWorker(t)
