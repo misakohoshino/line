@@ -159,15 +159,15 @@ func TestHandleDIVAInboundForwardsGroupTextAsV1(t *testing.T) {
 func TestHandleDIVAInboundV2ForwardsDirectCallButNotDirectText(t *testing.T) {
 	received := startDIVATestWorker(t)
 	t.Setenv("DIVA_CONTRACT_VERSION", "2")
-	lc := newDIVATestClient(&divaSyncBuffer{})
+	lc := newDIVAV2TestClient(io.Discard)
 
 	lc.handleDIVAInbound(&line.Message{
-		ID: "call-1", From: "ucaller", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
+		ID: "call-1", From: "usender", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
 		ContentMetadata: map[string]string{"ORGCONTP": "CALL", "RESULT": "CANCELED"},
-	}, "ucaller", "", false, int(OpReceiveMessage), divaOriginLive)
+	}, "usender", "", false, int(OpReceiveMessage), divaOriginLive)
 	lc.handleDIVAInbound(&line.Message{
-		ID: "text-1", From: "ucaller", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
-	}, "ucaller", "ordinary DM", false, int(OpReceiveMessage), divaOriginLive)
+		ID: "text-1", From: "usender", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
+	}, "usender", "ordinary DM", false, int(OpReceiveMessage), divaOriginLive)
 
 	select {
 	case body := <-received:
@@ -178,7 +178,7 @@ func TestHandleDIVAInboundV2ForwardsDirectCallButNotDirectText(t *testing.T) {
 		content, _ := got["content"].(map[string]any)
 		chat, _ := got["chat"].(map[string]any)
 		metadata, _ := got["metadata"].(map[string]any)
-		if content["type"] != "call" || chat["type"] != "direct" || chat["id"] != "ucaller" || metadata["ORGCONTP"] != "CALL" {
+		if content["type"] != "call" || chat["type"] != "direct" || chat["id"] != "usender" || metadata["ORGCONTP"] != "CALL" {
 			t.Fatalf("direct call payload = %v", got)
 		}
 	case <-time.After(2 * time.Second):
