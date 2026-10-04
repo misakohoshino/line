@@ -328,6 +328,24 @@ func divaV1ForwardDecision(msg *line.Message, text string, decryptionFailed bool
 func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool, opType int, origin divaOrigin) {
 	isGroupOrRoom := ToType(msg.ToType) == ToRoom || ToType(msg.ToType) == ToGroup
 	isDirectCall := ToType(msg.ToType) == ToUser && msg.ContentMetadata["ORGCONTP"] == "CALL"
+
+	// LINE-1D-C Production probe: upstream beeper/line already classifies calls
+	// from ORGCONTP=CALL, but a real direct-call event reached Matrix without
+	// reaching DIVA. Record only structural classification fields before the
+	// DIVA direct-message gate; never log message text or metadata values.
+	if origin == divaOriginLive && !isGroupOrRoom {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("diva_event", "DIVA_DIRECT_PROBE").
+			Str("message_id", msg.ID).
+			Int("to_type", msg.ToType).
+			Int("content_type", msg.ContentType).
+			Int("op_type", opType).
+			Bool("orgcontp_present", msg.ContentMetadata["ORGCONTP"] != "").
+			Bool("orgcontp_call", msg.ContentMetadata["ORGCONTP"] == "CALL").
+			Int("metadata_key_count", len(msg.ContentMetadata)).
+			Msg("[DIVA_DIRECT_PROBE]")
+	}
+
 	if !isGroupOrRoom && !isDirectCall {
 		return
 	}
