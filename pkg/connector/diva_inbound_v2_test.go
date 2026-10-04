@@ -260,9 +260,9 @@ func TestDIVAV2CallContent(t *testing.T) {
 		ContentType: int(ContentText),
 		ContentMetadata: map[string]string{
 			"ORGCONTP": "CALL",
-			"TYPE": "V",
+			"TYPE":     "V",
 			"DURATION": "61000",
-			"RESULT": "CANCELED",
+			"RESULT":   "CANCELED",
 		},
 	}
 	if got := divaV2ContentFor(&msg, "ignored", false); got != (divaV2CallContent{Type: "call"}) {
