@@ -438,3 +438,63 @@ func TestConvertLineMessageReturnsNoticeForDecryptFailure(t *testing.T) {
 		t.Fatal("notice body must not reuse LINE's historical fallback text")
 	}
 }
+
+
+func TestMergeDecryptedTextMetadataPreservesCallClassification(t *testing.T) {
+	msg := &line.Message{
+		ContentType: int(ContentText),
+		ContentMetadata: map[string]string{
+			"outer": "keep",
+		},
+	}
+	wrapper := map[string]any{
+		"text":       "Your version of LINE doesn't support this type of message.",
+		"ORGCONTP":   "CALL",
+		"TYPE":       "A",
+		"DURATION":   float64(0),
+		"switchable": true,
+		"nested":     map[string]any{"kind": "voice"},
+	}
+
+	mergeDecryptedTextMetadata(msg, wrapper)
+
+	if got := msg.ContentMetadata["outer"]; got != "keep" {
+		t.Fatalf("outer metadata = %q, want keep", got)
+	}
+	if got := msg.ContentMetadata["ORGCONTP"]; got != "CALL" {
+		t.Fatalf("ORGCONTP = %q, want CALL", got)
+	}
+	if got := msg.ContentMetadata["TYPE"]; got != "A" {
+		t.Fatalf("TYPE = %q, want A", got)
+	}
+	if got := msg.ContentMetadata["DURATION"]; got != "0" {
+		t.Fatalf("DURATION = %q, want 0", got)
+	}
+	if got := msg.ContentMetadata["switchable"]; got != "true" {
+		t.Fatalf("switchable = %q, want true", got)
+	}
+	if got := msg.ContentMetadata["nested"]; got != "{"kind":"voice"}" {
+		t.Fatalf("nested = %q, want JSON object", got)
+	}
+	if _, ok := msg.ContentMetadata["text"]; ok {
+		t.Fatal("decrypted text must not be copied into ContentMetadata")
+	}
+
+	content, ok := divaV2ContentFor(msg, wrapper["text"].(string), false).(divaV2CallContent)
+	if !ok || content.Type != "call" {
+		t.Fatalf("divaV2ContentFor() = %#v, want call content", content)
+	}
+}
+
+func TestMergeDecryptedTextMetadataInnerFieldsOverrideOuterLikeVyline(t *testing.T) {
+	msg := &line.Message{
+		ContentType: int(ContentText),
+		ContentMetadata: map[string]string{
+			"ORGCONTP": "OLD",
+		},
+	}
+	mergeDecryptedTextMetadata(msg, map[string]any{"ORGCONTP": "CALL"})
+	if got := msg.ContentMetadata["ORGCONTP"]; got != "CALL" {
+		t.Fatalf("ORGCONTP = %q, want decrypted CALL", got)
+	}
+}
