@@ -1,0 +1,21 @@
+name: Test LINE-1D Group Events
+
+on:
+  push:
+    branches:
+      - feat/line1d-group-events-20261005
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run targeted connector tests
+        run: go test ./pkg/connector -run 'TestDIVAV2LiveGroupEvent|TestHandleDIVAGroupOperation|TestDIVAV2Golden' -count=1
