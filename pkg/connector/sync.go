@@ -1896,9 +1896,11 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Msg("Ignoring malformed notified member removal")
 			return
 		}
+		lc.handleDIVAGroupOperation(op)
 		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, removal)
 
 	case OpNotifiedLeaveChat:
+		lc.handleDIVAGroupOperation(op)
 		lower1 := strings.ToLower(op.Param1)
 		if strings.HasPrefix(lower1, "c") || strings.HasPrefix(lower1, "r") {
 			lc.handleMemberLeft(op.Param1, op.Param2)
@@ -1907,6 +1909,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		}
 
 	case OpNotifiedJoinChat:
+		lc.handleDIVAGroupOperation(op)
 		lc.handleMemberJoin(op.Param1, op.Param2)
 
 	case OpCancelInvitation:

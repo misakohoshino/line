@@ -341,6 +341,42 @@ func divaIsDirectCall(msg *line.Message, opType int) bool {
 		msg.ContentMetadata["MESSAGE_TARGET"] != ""
 }
 
+// handleDIVAGroupOperation forwards the normalized live membership events used
+// by LINE-1D-D. v1 has no generic event envelope, so it intentionally remains
+// a no-op unless contract v2 is enabled. Group events can never auto-reply.
+func (lc *LineClient) handleDIVAGroupOperation(op line.Operation) {
+	if lc.divaContractVersion() != divaContractV2 {
+		return
+	}
+	event, ok := lc.buildDIVAV2LiveGroupEvent(op)
+	if !ok {
+		lc.UserLogin.Bridge.Log.Debug().
+			Int("op_type", op.Type).
+			Str("revision", op.Revision.String()).
+			Str("param1", op.Param1).
+			Str("param2", op.Param2).
+			Str("param3", op.Param3).
+			Msg("[DIVA_GROUP_EVENT] unsupported live membership operation shape")
+		return
+	}
+
+	actorMID := ""
+	if event.GroupEvent.Actor != nil {
+		actorMID = event.GroupEvent.Actor.Mid
+	}
+	lc.UserLogin.Bridge.Log.Debug().
+		Str("diva_event", "DIVA_GROUP_EVENT").
+		Str("event_id", event.EventID).
+		Str("group_id", event.Chat.ID).
+		Str("group_event_type", event.GroupEvent.Type).
+		Str("member_id", event.GroupEvent.Member.Mid).
+		Str("actor_id", actorMID).
+		Msg("[DIVA_GROUP_EVENT]")
+
+	encode := func() ([]byte, error) { return json.Marshal(event) }
+	lc.forwardDIVAInbound(encode, nil, event.Chat.ID, event.EventID, false)
+}
+
 func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool, opType int, origin divaOrigin) {
 	isGroupOrRoom := ToType(msg.ToType) == ToRoom || ToType(msg.ToType) == ToGroup
 	isDirectCall := divaIsDirectCall(msg, opType)
