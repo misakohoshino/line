@@ -179,8 +179,11 @@ func TestHandleDIVAInboundV2ForwardsDirectCallButNotDirectText(t *testing.T) {
 		content, _ := got["content"].(map[string]any)
 		chat, _ := got["chat"].(map[string]any)
 		metadata, _ := got["metadata"].(map[string]any)
-		if content["type"] != "call" || chat["type"] != "direct" || chat["id"] != "usender" || metadata["MESSAGE_TARGET"] != "u1234567" {
+		if content["type"] != "call" || chat["type"] != "direct" || chat["id"] != "usender" {
 			t.Fatalf("direct call payload = %v", got)
+		}
+		if _, leaked := metadata["MESSAGE_TARGET"]; leaked {
+			t.Fatalf("MESSAGE_TARGET routing metadata leaked to worker: %v", metadata)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("direct call was not forwarded to the DIVA worker")
