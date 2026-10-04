@@ -340,9 +340,19 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 				metadataKey = key
 			}
 		}
+		messageTarget := msg.ContentMetadata["MESSAGE_TARGET"]
+		messageTargetUpper := strings.ToUpper(strings.TrimSpace(messageTarget))
+		messageTargetJSON := strings.HasPrefix(strings.TrimSpace(messageTarget), "{") || strings.HasPrefix(strings.TrimSpace(messageTarget), "[")
 		lc.UserLogin.Bridge.Log.Debug().
 			Str("diva_event", "DIVA_DIRECT_PROBE").
 			Str("metadata_single_key", metadataKey).
+			Int("message_target_len", len(messageTarget)).
+			Bool("message_target_eq_from", messageTarget != "" && messageTarget == msg.From).
+			Bool("message_target_eq_to", messageTarget != "" && messageTarget == msg.To).
+			Bool("message_target_eq_self", messageTarget != "" && messageTarget == lc.Mid).
+			Bool("message_target_mid_like", strings.HasPrefix(messageTarget, "u") || strings.HasPrefix(messageTarget, "U") || strings.HasPrefix(messageTarget, "c") || strings.HasPrefix(messageTarget, "C") || strings.HasPrefix(messageTarget, "r") || strings.HasPrefix(messageTarget, "R")).
+			Bool("message_target_json_like", messageTargetJSON).
+			Bool("message_target_call_like", messageTargetUpper == "CALL" || messageTargetUpper == "VOICE" || messageTargetUpper == "VIDEO" || messageTargetUpper == "VOIP" || messageTargetUpper == "PHONE").
 			Str("message_id", msg.ID).
 			Int("to_type", msg.ToType).
 			Int("content_type", msg.ContentType).
