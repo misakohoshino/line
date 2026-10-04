@@ -342,6 +342,7 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 			Int("op_type", opType).
 			Bool("orgcontp_present", msg.ContentMetadata["ORGCONTP"] != "").
 			Bool("orgcontp_call", msg.ContentMetadata["ORGCONTP"] == "CALL").
+			Bool("has_e2ee_version", msg.ContentMetadata["e2eeVersion"] != "").
 			Int("metadata_key_count", len(msg.ContentMetadata)).
 			Msg("[DIVA_DIRECT_PROBE]")
 	}
