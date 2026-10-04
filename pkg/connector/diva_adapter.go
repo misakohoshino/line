@@ -316,16 +316,19 @@ func divaV1ForwardDecision(msg *line.Message, text string, decryptionFailed bool
 	return ""
 }
 
-// handleDIVAInbound is the single DIVA hook in the LINE receive path. It only
-// considers group and room messages and logs a content-free debug record.
+// handleDIVAInbound is the single DIVA hook in the LINE receive path. Normal
+// DIVA traffic stays group/room-only. LINE-1D-C additionally admits direct
+// ORGCONTP=CALL summaries so Server A can tell a caller that this account does
+// not accept calls; ordinary direct messages remain outside DIVA.
 //
 // Under v1 it forwards genuine live text only; backfill cannot be labelled in
-// v1, so it is not forwarded at all. Under v2 every bridgeable group/room
-// message is forwarded with origin, is_from_me and decryption_failed so Server
-// A can tell them apart. It is a no-op for the worker unless DIVA_WEBHOOK_URL
-// is set.
+// v1, so it is not forwarded at all. Under v2 every admitted bridgeable message
+// is forwarded with origin, is_from_me and decryption_failed so Server A can
+// tell them apart. It is a no-op for the worker unless DIVA_WEBHOOK_URL is set.
 func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool, opType int, origin divaOrigin) {
-	if ToType(msg.ToType) != ToRoom && ToType(msg.ToType) != ToGroup {
+	isGroupOrRoom := ToType(msg.ToType) == ToRoom || ToType(msg.ToType) == ToGroup
+	isDirectCall := ToType(msg.ToType) == ToUser && msg.ContentMetadata["ORGCONTP"] == "CALL"
+	if !isGroupOrRoom && !isDirectCall {
 		return
 	}
 
