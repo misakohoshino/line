@@ -156,6 +156,42 @@ func TestHandleDIVAInboundForwardsGroupTextAsV1(t *testing.T) {
 	}
 }
 
+func TestHandleDIVAInboundV2ForwardsDirectCallButNotDirectText(t *testing.T) {
+	received := startDIVATestWorker(t)
+	t.Setenv("DIVA_CONTRACT_VERSION", "2")
+	lc := newDIVAV2TestClient(io.Discard)
+
+	lc.handleDIVAInbound(&line.Message{
+		ID: "call-1", From: "usender", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
+		ContentMetadata: map[string]string{"ORGCONTP": "CALL", "RESULT": "CANCELED"},
+	}, "usender", "", false, int(OpReceiveMessage), divaOriginLive)
+	lc.handleDIVAInbound(&line.Message{
+		ID: "text-1", From: "usender", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
+	}, "usender", "ordinary DM", false, int(OpReceiveMessage), divaOriginLive)
+
+	select {
+	case body := <-received:
+		var got map[string]any
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("worker received invalid JSON: %v", err)
+		}
+		content, _ := got["content"].(map[string]any)
+		chat, _ := got["chat"].(map[string]any)
+		metadata, _ := got["metadata"].(map[string]any)
+		if content["type"] != "call" || chat["type"] != "direct" || chat["id"] != "usender" || metadata["ORGCONTP"] != "CALL" {
+			t.Fatalf("direct call payload = %v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("direct call was not forwarded to the DIVA worker")
+	}
+
+	select {
+	case body := <-received:
+		t.Fatalf("ordinary direct message leaked to DIVA worker: %s", body)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 func TestHandleDIVAInboundWithholdsMediaAndDMs(t *testing.T) {
 	received := startDIVATestWorker(t)
 	logs := &divaSyncBuffer{}

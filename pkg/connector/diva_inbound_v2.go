@@ -124,6 +124,10 @@ type divaV2ContactContent struct {
 	DisplayName *string `json:"display_name"`
 }
 
+type divaV2CallContent struct {
+	Type string `json:"type"`
+}
+
 type divaV2UnsupportedContent struct {
 	Type string `json:"type"`
 }
@@ -228,8 +232,13 @@ func divaDisplayName(mid, name string) *string {
 }
 
 func divaV2ContentFor(msg *line.Message, unwrappedText string, decryptionFailed bool) any {
-	// LINE wraps calls, device contacts (vCard) and note/album notifications in
-	// other content types with ORGCONTP. They are not user content yet (1D).
+	// LINE call summaries are wrapped in ORGCONTP=CALL rather than a dedicated
+	// numeric ContentType. LINE-1D-C only needs a stable call marker; voice/video,
+	// duration and result stay inside the bridge.
+	if msg.ContentMetadata["ORGCONTP"] == "CALL" {
+		return divaV2CallContent{Type: "call"}
+	}
+	// Other LINE-wrapped notices are not user content yet.
 	if msg.ContentMetadata["ORGCONTP"] != "" || isPostNotification(msg) {
 		return divaV2UnsupportedContent{Type: "unsupported"}
 	}
