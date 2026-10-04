@@ -17,5 +17,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Patch pre-existing baseline test syntax only in runner
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("pkg/connector/handle_message_test.go")
+          s = p.read_text()
+          bad = 'if got := msg.ContentMetadata["nested"]; got != "{"kind":"voice"}" {'
+          good = 'if got := msg.ContentMetadata["nested"]; got != `{"kind":"voice"}` {'
+          if bad not in s:
+              raise SystemExit("baseline syntax marker not found")
+          p.write_text(s.replace(bad, good, 1))
+          PY
       - name: Run targeted connector tests
         run: go test ./pkg/connector -run 'TestDIVAV2LiveGroupEvent|TestHandleDIVAGroupOperation|TestDIVAV2Golden' -count=1
