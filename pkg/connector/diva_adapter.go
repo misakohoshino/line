@@ -325,45 +325,25 @@ func divaV1ForwardDecision(msg *line.Message, text string, decryptionFailed bool
 // v1, so it is not forwarded at all. Under v2 every admitted bridgeable message
 // is forwarded with origin, is_from_me and decryption_failed so Server A can
 // tell them apart. It is a no-op for the worker unless DIVA_WEBHOOK_URL is set.
+func divaIsDirectCall(msg *line.Message, opType int) bool {
+	if msg == nil || ToType(msg.ToType) != ToUser || opType != int(OpReceiveMessage) {
+		return false
+	}
+	if msg.ContentMetadata["ORGCONTP"] == "CALL" {
+		return true
+	}
+	// Production handset evidence: current LINE Chrome/SSE emits a direct call
+	// notice as ContentType=0 with exactly one MESSAGE_TARGET metadata field.
+	// A normal encrypted direct text on the same account instead carries only
+	// e2eeVersion, so ordinary direct messages remain outside the DIVA gate.
+	return ContentType(msg.ContentType) == ContentText &&
+		len(msg.ContentMetadata) == 1 &&
+		msg.ContentMetadata["MESSAGE_TARGET"] != ""
+}
+
 func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool, opType int, origin divaOrigin) {
 	isGroupOrRoom := ToType(msg.ToType) == ToRoom || ToType(msg.ToType) == ToGroup
-	isDirectCall := ToType(msg.ToType) == ToUser && msg.ContentMetadata["ORGCONTP"] == "CALL"
-
-	// LINE-1D-C Production probe: upstream beeper/line already classifies calls
-	// from ORGCONTP=CALL, but a real direct-call event reached Matrix without
-	// reaching DIVA. Record only structural classification fields before the
-	// DIVA direct-message gate; never log message text or metadata values.
-	if origin == divaOriginLive && !isGroupOrRoom {
-		metadataKey := ""
-		if len(msg.ContentMetadata) == 1 {
-			for key := range msg.ContentMetadata {
-				metadataKey = key
-			}
-		}
-		messageTarget := msg.ContentMetadata["MESSAGE_TARGET"]
-		messageTargetUpper := strings.ToUpper(strings.TrimSpace(messageTarget))
-		messageTargetJSON := strings.HasPrefix(strings.TrimSpace(messageTarget), "{") || strings.HasPrefix(strings.TrimSpace(messageTarget), "[")
-		lc.UserLogin.Bridge.Log.Debug().
-			Str("diva_event", "DIVA_DIRECT_PROBE").
-			Str("metadata_single_key", metadataKey).
-			Int("message_target_len", len(messageTarget)).
-			Bool("message_target_eq_from", messageTarget != "" && messageTarget == msg.From).
-			Bool("message_target_eq_to", messageTarget != "" && messageTarget == msg.To).
-			Bool("message_target_eq_self", messageTarget != "" && messageTarget == lc.Mid).
-			Bool("message_target_mid_like", strings.HasPrefix(messageTarget, "u") || strings.HasPrefix(messageTarget, "U") || strings.HasPrefix(messageTarget, "c") || strings.HasPrefix(messageTarget, "C") || strings.HasPrefix(messageTarget, "r") || strings.HasPrefix(messageTarget, "R")).
-			Bool("message_target_json_like", messageTargetJSON).
-			Bool("message_target_call_like", messageTargetUpper == "CALL" || messageTargetUpper == "VOICE" || messageTargetUpper == "VIDEO" || messageTargetUpper == "VOIP" || messageTargetUpper == "PHONE").
-			Str("message_id", msg.ID).
-			Int("to_type", msg.ToType).
-			Int("content_type", msg.ContentType).
-			Int("op_type", opType).
-			Bool("orgcontp_present", msg.ContentMetadata["ORGCONTP"] != "").
-			Bool("orgcontp_call", msg.ContentMetadata["ORGCONTP"] == "CALL").
-			Bool("has_e2ee_version", msg.ContentMetadata["e2eeVersion"] != "").
-			Bool("has_gc_evt_type", msg.ContentMetadata["GC_EVT_TYPE"] != "").
-			Int("metadata_key_count", len(msg.ContentMetadata)).
-			Msg("[DIVA_DIRECT_PROBE]")
-	}
+	isDirectCall := divaIsDirectCall(msg, opType)
 
 	if !isGroupOrRoom && !isDirectCall {
 		return
