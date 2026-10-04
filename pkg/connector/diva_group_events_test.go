@@ -84,6 +84,45 @@ func TestDIVAV2LiveGroupEventShapes(t *testing.T) {
 	}
 }
 
+func TestDIVAV2LiveGroupEventAdditionalShapes(t *testing.T) {
+	lc := newDIVAV2TestClient(io.Discard)
+
+	t.Run("normal leave shape", func(t *testing.T) {
+		event, ok := lc.buildDIVAV2LiveGroupEvent(line.Operation{
+			Revision: "704", Type: int(OpNotifiedLeaveChat),
+			Param1: "cgroup", Param2: "udriver",
+			CreatedTime: "1727654324000",
+		})
+		if !ok || event == nil {
+			t.Fatal("expected normal leave shape")
+		}
+		if event.Chat.ID != "cgroup" || event.GroupEvent.Member.Mid != "udriver" ||
+			event.GroupEvent.Actor == nil || event.GroupEvent.Actor.Mid != "udriver" {
+			t.Fatalf("unexpected leave event: %+v", event)
+		}
+	})
+
+	t.Run("own member marks is_from_me", func(t *testing.T) {
+		event, ok := lc.buildDIVAV2LiveGroupEvent(line.Operation{
+			Revision: "705", Type: int(OpNotifiedJoinChat),
+			Param1: "cgroup", Param2: divaTestAccount,
+		})
+		if !ok || event == nil || !event.GroupEvent.Member.IsFromMe {
+			t.Fatalf("own member event = %+v ok=%v", event, ok)
+		}
+	})
+
+	t.Run("room chat type", func(t *testing.T) {
+		event, ok := lc.buildDIVAV2LiveGroupEvent(line.Operation{
+			Revision: "706", Type: int(OpNotifiedJoinChat),
+			Param1: "rroom", Param2: "udriver",
+		})
+		if !ok || event == nil || event.Chat.Type != "room" {
+			t.Fatalf("room event = %+v ok=%v", event, ok)
+		}
+	})
+}
+
 func TestDIVAV2LiveGroupEventRejectsUnstableOrUnrelatedOps(t *testing.T) {
 	lc := newDIVAV2TestClient(io.Discard)
 
