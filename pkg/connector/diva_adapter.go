@@ -350,6 +350,13 @@ func (lc *LineClient) handleDIVAGroupOperation(op line.Operation) {
 	}
 	event, ok := lc.buildDIVAV2LiveGroupEvent(op)
 	if !ok {
+		lc.UserLogin.Bridge.Log.Debug().
+			Int("op_type", op.Type).
+			Str("revision", op.Revision.String()).
+			Str("param1", op.Param1).
+			Str("param2", op.Param2).
+			Str("param3", op.Param3).
+			Msg("[DIVA_GROUP_EVENT] unsupported live membership operation shape")
 		return
 	}
 
