@@ -132,6 +132,107 @@ type divaV2UnsupportedContent struct {
 	Type string `json:"type"`
 }
 
+const (
+	divaGroupEventMemberJoined  = "member_joined"
+	divaGroupEventMemberLeft    = "member_left"
+	divaGroupEventMemberRemoved = "member_removed"
+)
+
+type divaV2GroupMember struct {
+	Mid      string `json:"mid"`
+	IsFromMe bool   `json:"is_from_me"`
+}
+
+type divaV2GroupEventContent struct {
+	Type      string             `json:"type"`
+	Member    divaV2GroupMember  `json:"member"`
+	Actor     *divaV2GroupMember `json:"actor"`
+	CreatedAt *int64             `json:"created_at"`
+}
+
+type divaV2GroupEvent struct {
+	Version    int                     `json:"version"`
+	EventID    string                  `json:"event_id"`
+	EventType  string                  `json:"event_type"`
+	Origin     divaOrigin              `json:"origin"`
+	Account    divaV2Account           `json:"account"`
+	Chat       divaV2Chat              `json:"chat"`
+	GroupEvent divaV2GroupEventContent `json:"group_event"`
+}
+
+// buildDIVAV2LiveGroupEvent normalizes only live LINE membership operations
+// that DIVA needs in LINE-1D-D. Historical ContentSystem records deliberately
+// stay out of DIVA until durable ingestion/deduplication exists; otherwise one
+// logical membership change can be emitted once as an operation and again
+// later during startup backfill.
+func (lc *LineClient) buildDIVAV2LiveGroupEvent(op line.Operation) (*divaV2GroupEvent, bool) {
+	revision, err := op.Revision.Int64()
+	if err != nil || revision <= 0 {
+		return nil, false
+	}
+
+	var eventType, chatMID, memberMID, actorMID string
+	switch OperationType(op.Type) {
+	case OpNotifiedJoinChat:
+		eventType = divaGroupEventMemberJoined
+		chatMID = op.Param1
+		memberMID = op.Param2
+	case OpNotifiedLeaveChat:
+		eventType = divaGroupEventMemberLeft
+		if isChatMID(op.Param1) {
+			chatMID, memberMID = op.Param1, op.Param2
+		} else if isChatMID(op.Param2) {
+			chatMID, memberMID = op.Param2, op.Param1
+		}
+		actorMID = memberMID
+	case OpNotifiedDeleteOtherFromChat:
+		eventType = divaGroupEventMemberRemoved
+		chatMID = op.Param1
+		actorMID = op.Param2
+		memberMID = op.Param3
+	default:
+		return nil, false
+	}
+
+	if !isChatMID(chatMID) || !isUserMID(memberMID) {
+		return nil, false
+	}
+	if actorMID != "" && !isUserMID(actorMID) {
+		return nil, false
+	}
+
+	chatType := "group"
+	if strings.HasPrefix(strings.ToLower(chatMID), "r") {
+		chatType = "room"
+	}
+
+	var createdAt *int64
+	if ts, tsErr := op.CreatedTime.Int64(); tsErr == nil && ts > 0 {
+		createdAt = &ts
+	}
+
+	member := divaV2GroupMember{Mid: memberMID, IsFromMe: lc.isOwnMID(memberMID)}
+	var actor *divaV2GroupMember
+	if actorMID != "" {
+		actor = &divaV2GroupMember{Mid: actorMID, IsFromMe: lc.isOwnMID(actorMID)}
+	}
+
+	return &divaV2GroupEvent{
+		Version:   divaContractV2,
+		EventID:   "line:op:" + strconv.FormatInt(revision, 10),
+		EventType: "group_event",
+		Origin:    divaOriginLive,
+		Account:   divaV2Account{Mid: lc.midOrFallback()},
+		Chat:      divaV2Chat{ID: chatMID, Type: chatType},
+		GroupEvent: divaV2GroupEventContent{
+			Type:      eventType,
+			Member:    member,
+			Actor:     actor,
+			CreatedAt: createdAt,
+		},
+	}, true
+}
+
 // buildDIVAV2Event builds the v2 envelope for one inbound message.
 // unwrappedText is only used for genuine text messages.
 func (lc *LineClient) buildDIVAV2Event(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool, opType int, origin divaOrigin) *divaV2Event {
