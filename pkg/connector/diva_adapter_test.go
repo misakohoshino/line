@@ -163,10 +163,11 @@ func TestHandleDIVAInboundV2ForwardsDirectCallButNotDirectText(t *testing.T) {
 
 	lc.handleDIVAInbound(&line.Message{
 		ID: "call-1", From: "usender", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
-		ContentMetadata: map[string]string{"ORGCONTP": "CALL", "RESULT": "CANCELED"},
+		ContentMetadata: map[string]string{"MESSAGE_TARGET": "u1234567"},
 	}, "usender", "", false, int(OpReceiveMessage), divaOriginLive)
 	lc.handleDIVAInbound(&line.Message{
 		ID: "text-1", From: "usender", To: "ume", ToType: int(ToUser), ContentType: int(ContentText),
+		ContentMetadata: map[string]string{"e2eeVersion": "2"},
 	}, "usender", "ordinary DM", false, int(OpReceiveMessage), divaOriginLive)
 
 	select {
@@ -178,7 +179,7 @@ func TestHandleDIVAInboundV2ForwardsDirectCallButNotDirectText(t *testing.T) {
 		content, _ := got["content"].(map[string]any)
 		chat, _ := got["chat"].(map[string]any)
 		metadata, _ := got["metadata"].(map[string]any)
-		if content["type"] != "call" || chat["type"] != "direct" || chat["id"] != "usender" || metadata["ORGCONTP"] != "CALL" {
+		if content["type"] != "call" || chat["type"] != "direct" || chat["id"] != "usender" || metadata["MESSAGE_TARGET"] != "u1234567" {
 			t.Fatalf("direct call payload = %v", got)
 		}
 	case <-time.After(2 * time.Second):
