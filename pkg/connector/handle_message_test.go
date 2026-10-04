@@ -473,7 +473,7 @@ func TestMergeDecryptedTextMetadataPreservesCallClassification(t *testing.T) {
 	if got := msg.ContentMetadata["switchable"]; got != "true" {
 		t.Fatalf("switchable = %q, want true", got)
 	}
-	if got := msg.ContentMetadata["nested"]; got != "{"kind":"voice"}" {
+	if got := msg.ContentMetadata["nested"]; got != `{"kind":"voice"}` {
 		t.Fatalf("nested = %q, want JSON object", got)
 	}
 	if _, ok := msg.ContentMetadata["text"]; ok {
