@@ -334,8 +334,15 @@ func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedTex
 	// reaching DIVA. Record only structural classification fields before the
 	// DIVA direct-message gate; never log message text or metadata values.
 	if origin == divaOriginLive && !isGroupOrRoom {
+		metadataKey := ""
+		if len(msg.ContentMetadata) == 1 {
+			for key := range msg.ContentMetadata {
+				metadataKey = key
+			}
+		}
 		lc.UserLogin.Bridge.Log.Debug().
 			Str("diva_event", "DIVA_DIRECT_PROBE").
+			Str("metadata_single_key", metadataKey).
 			Str("message_id", msg.ID).
 			Int("to_type", msg.ToType).
 			Int("content_type", msg.ContentType).
