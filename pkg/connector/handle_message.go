@@ -359,12 +359,42 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 	if strings.HasPrefix(bodyText, "{") {
 		var wrapper map[string]any
 		if err := json.Unmarshal([]byte(bodyText), &wrapper); err == nil {
+			// Match Vyline's proven E2EE behavior: decrypted LINE JSON can carry
+			// message metadata alongside "text". Preserve those fields so later
+			// call/contact/post classification sees the same metadata as plaintext
+			// messages. Limit this to successfully decrypted text envelopes; media
+			// key material must remain in the decrypted body only.
+			if len(msg.Chunks) > 0 && !decryptionFailed && ContentType(msg.ContentType) == ContentText {
+				mergeDecryptedTextMetadata(msg, wrapper)
+			}
 			if t, ok := wrapper["text"].(string); ok {
 				unwrappedText = t
 			}
 		}
 	}
 	return bodyText, unwrappedText, decryptionFailed
+}
+
+func mergeDecryptedTextMetadata(msg *line.Message, wrapper map[string]any) {
+	if msg == nil || len(wrapper) == 0 {
+		return
+	}
+	if msg.ContentMetadata == nil {
+		msg.ContentMetadata = make(map[string]string)
+	}
+	for key, value := range wrapper {
+		if key == "text" || value == nil {
+			continue
+		}
+		if text, ok := value.(string); ok {
+			msg.ContentMetadata[key] = text
+			continue
+		}
+		encoded, err := json.Marshal(value)
+		if err == nil {
+			msg.ContentMetadata[key] = string(encoded)
+		}
+	}
 }
 
 func isLineDecryptFallbackText(text string) bool {
