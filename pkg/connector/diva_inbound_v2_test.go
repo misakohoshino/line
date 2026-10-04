@@ -255,10 +255,24 @@ func TestDIVAV2GoldenBackfillSticker(t *testing.T) {
 	}`)
 }
 
-// LINE-wrapped notices and unknown types are never presented as text.
+func TestDIVAV2CallContent(t *testing.T) {
+	msg := line.Message{
+		ContentType: int(ContentText),
+		ContentMetadata: map[string]string{
+			"ORGCONTP": "CALL",
+			"TYPE": "V",
+			"DURATION": "61000",
+			"RESULT": "CANCELED",
+		},
+	}
+	if got := divaV2ContentFor(&msg, "ignored", false); got != (divaV2CallContent{Type: "call"}) {
+		t.Fatalf("call content = %#v, want call marker only", got)
+	}
+}
+
+// Other LINE-wrapped notices and unknown types are never presented as text.
 func TestDIVAV2WrappedNoticesAreUnsupported(t *testing.T) {
 	cases := []line.Message{
-		{ContentType: int(ContentText), ContentMetadata: map[string]string{"ORGCONTP": "CALL"}},
 		{ContentType: int(ContentText), ContentMetadata: map[string]string{"ORGCONTP": "CONTACT", "vCard": "BEGIN:VCARD"}},
 		{ContentType: int(ContentPostNotification)},
 		{ContentType: int(ContentFlex)},
