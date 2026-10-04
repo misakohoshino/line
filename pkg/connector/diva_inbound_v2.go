@@ -235,7 +235,7 @@ func divaV2ContentFor(msg *line.Message, unwrappedText string, decryptionFailed 
 	// LINE call summaries are wrapped in ORGCONTP=CALL rather than a dedicated
 	// numeric ContentType. LINE-1D-C only needs a stable call marker; voice/video,
 	// duration and result stay inside the bridge.
-	if msg.ContentMetadata["ORGCONTP"] == "CALL" {
+	if divaIsDirectCall(msg, int(OpReceiveMessage)) {
 		return divaV2CallContent{Type: "call"}
 	}
 	// Other LINE-wrapped notices are not user content yet.
