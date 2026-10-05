@@ -88,6 +88,10 @@ type LineClient struct {
 	divaGroupLeaveMu sync.Mutex
 	divaGroupLeaves  map[divaGroupLeaveKey]divaGroupLeaveMarker
 
+	// receiveStatus records receive-channel facts for the read-only DIVA
+	// /diva/v1/status endpoint. It never drives LINE behavior.
+	receiveStatus lineReceiveStatus
+
 	wg sync.WaitGroup
 }
 
@@ -350,7 +354,7 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated by another client; marking login bad credentials")
 	}
 	if sendState && lc.UserLogin.BridgeState != nil {
-		lc.UserLogin.BridgeState.Send(status.BridgeState{
+		lc.sendBridgeState(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      "line-logged-out",
 			Message:    "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE.",
@@ -369,7 +373,7 @@ func (lc *LineClient) sendConnectedStateIfCurrent(ctx context.Context) bool {
 		return false
 	}
 	lc.UserLogin.Bridge.Log.Info().Int("token_len", len(lc.getAccessToken())).Msg("LINE client connected; notifying bridge")
-	lc.UserLogin.BridgeState.Send(status.BridgeState{
+	lc.sendBridgeState(status.BridgeState{
 		StateEvent: status.StateConnected,
 	})
 	return true
@@ -418,7 +422,7 @@ func (lc *LineClient) markMissingE2EEKey(ctx context.Context, err error) {
 	if lc.UserLogin.Bridge != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE E2EE private key missing; marking login for full reconnect")
 	}
-	lc.UserLogin.BridgeState.Send(status.BridgeState{
+	lc.sendBridgeState(status.BridgeState{
 		StateEvent: status.StateBadCredentials,
 		Error:      "line-e2ee-key-missing",
 		Message:    lineMissingE2EEKeyMessage,
@@ -553,7 +557,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 				lc.markLoggedOutByOtherClient(ctx, err)
 				return
 			}
-			lc.UserLogin.BridgeState.Send(status.BridgeState{
+			lc.sendBridgeState(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      "line-login-failed",
 				Message:    err.Error(),
@@ -572,7 +576,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 			lc.markLoggedOutByOtherClient(ctx, err)
 			return
 		}
-		lc.UserLogin.BridgeState.Send(status.BridgeState{
+		lc.sendBridgeState(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      "line-token-expired",
 			Message:    fmt.Sprintf("session expired and could not be restored: %v", err),
@@ -689,7 +693,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		if pin != "" {
 			lc.UserLogin.Bridge.Log.Warn().Msg("PIN verification required — check your LINE mobile app to complete re-login")
 			// Send the PIN via bridge state so the user sees it in their Matrix client
-			lc.UserLogin.BridgeState.Send(status.BridgeState{
+			lc.sendBridgeState(status.BridgeState{
 				StateEvent: status.StateConnecting,
 				Error:      "line-pin-required",
 				Message:    fmt.Sprintf("Enter this PIN on your LINE mobile app: %s", pin),
