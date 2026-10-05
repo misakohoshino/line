@@ -1548,8 +1548,12 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		if lc.isSessionInvalidated() {
 			return
 		}
+		if ctx.Err() == nil {
+			lc.receiveStatus.recordAuthProbe(false)
+		}
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get last op revision")
 	} else {
+		lc.receiveStatus.recordAuthProbe(true)
 		localRev = rev
 		lc.UserLogin.Bridge.Log.Info().Int64("local_rev", localRev).Msg("Seeded local revision from getLastOpRevision")
 	}
@@ -1568,7 +1572,12 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		return false
 	}
 
+	// streamEvents counts events of the current SSE attempt, so an attempt
+	// that ends without delivering anything counts as a receive failure.
+	var streamEvents int
 	handler := func(eventType, data string) {
+		streamEvents++
+		lc.receiveStatus.recordSSEEvent()
 		// handle keep alives
 		if eventType == "ping" || eventType == "connInfoRevision" {
 			return
@@ -1632,6 +1641,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		}
 
 		client = lc.newClient()
+		streamEvents = 0
 		err := listenSSEWithClient(client, receiveCtx, localRev, handler)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -1645,6 +1655,9 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			}
 			if errors.Is(err, context.Canceled) {
 				return
+			}
+			if !errors.Is(err, io.EOF) || streamEvents == 0 {
+				lc.receiveStatus.recordSSEFailure()
 			}
 			if !errors.Is(err, io.EOF) {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("SSE Disconnected")
@@ -1688,11 +1701,13 @@ func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
 	probeClient := lc.newClient()
 	_, probeErr := getLastOpRevisionWithClient(ctx, probeClient)
 	if probeErr == nil {
+		lc.receiveStatus.recordAuthProbe(true)
 		return false
 	}
 	if ctx.Err() != nil {
 		return true
 	}
+	lc.receiveStatus.recordAuthProbe(false)
 
 	if line.IsUnauthorizedStatus(probeErr) {
 		return lc.handleReceiveAuthError(ctx, probeClient, probeErr)
@@ -1771,7 +1786,7 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *
 		lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
 	}
 	if lc.UserLogin != nil && lc.UserLogin.BridgeState != nil {
-		lc.UserLogin.BridgeState.Send(status.BridgeState{
+		lc.sendBridgeState(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      "line-logged-out",
 			Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",

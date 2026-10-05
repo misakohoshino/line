@@ -240,6 +240,9 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 		}
 	}
 
+	if existing, ok := override.Client.(*LineClient); ok && existing != nil {
+		existing.receiveStatus.recordBridgeState(status.StateConnecting, "")
+	}
 	override.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
 
 	res, err := loginWithCredentials(ll.Email, ll.Password, ll.Certificate)

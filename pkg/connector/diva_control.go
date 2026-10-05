@@ -757,6 +757,7 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 func (s *divaControlServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/diva/v1/health", s.handleHealth)
+	mux.HandleFunc("/diva/v1/status", s.handleStatus)
 	mux.HandleFunc("/diva/v1/send", s.handleSend)
 	mux.HandleFunc("/diva/v1/send-media", s.handleSendMedia)
 	return mux
