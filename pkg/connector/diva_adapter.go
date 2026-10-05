@@ -360,6 +360,10 @@ func (lc *LineClient) handleDIVAGroupOperation(op line.Operation) {
 		return
 	}
 
+	if !lc.admitDIVAGroupEvent(event, op.Revision.String()) {
+		return
+	}
+
 	actorMID := ""
 	if event.GroupEvent.Actor != nil {
 		actorMID = event.GroupEvent.Actor.Mid
@@ -375,6 +379,104 @@ func (lc *LineClient) handleDIVAGroupOperation(op line.Operation) {
 
 	encode := func() ([]byte, error) { return json.Marshal(event) }
 	lc.forwardDIVAInbound(encode, nil, event.Chat.ID, event.EventID, false)
+}
+
+// divaGroupLeaveWindow bounds how long a live member_removed (op 133) claims
+// the trailing member_left (op 61) for the same chat member. When another
+// member kicks someone, LINE sends op 133 (remover known) and then op 61 (the
+// generic "no longer in the chat" notice) for the same logical removal. A
+// genuine self leave only sends op 61.
+const divaGroupLeaveWindow = 10 * time.Second
+
+// divaGroupEventNow is the wall clock for leave markers. It is a variable only
+// so tests can move time without sleeping; production always uses time.Now.
+var divaGroupEventNow = time.Now
+
+type divaGroupLeaveKey struct {
+	account string
+	chat    string
+	member  string
+}
+
+// divaGroupLeaveMarker remembers the last forwarded leave-type event for one
+// chat member. It is memory-only: a restart in the middle of a kick only means
+// DIVA receives both events, exactly as before this normalization existed.
+type divaGroupLeaveMarker struct {
+	eventType  string
+	revision   string
+	receivedAt time.Time
+}
+
+// admitDIVAGroupEvent decides whether a normalized live group event is
+// forwarded to DIVA. It only affects the DIVA copy of the operation; the
+// caller's Matrix/Beeper membership handling always runs unchanged.
+//
+//   - member_removed: forwarded and remembered.
+//   - member_left right after member_removed for the same account/chat/member:
+//     the trailing op 61 of a kick, suppressed so DIVA sees one member_removed.
+//   - member_left otherwise: a genuine leave, forwarded and remembered.
+//   - member_removed right after member_left: unexpected reverse order. Both
+//     stay forwarded (no reordering queue); only a warning is logged.
+//   - member_joined: forwarded and clears the marker, so a quick rejoin and a
+//     later leave are never mistaken for a kick's trailing op.
+func (lc *LineClient) admitDIVAGroupEvent(event *divaV2GroupEvent, revision string) bool {
+	key := divaGroupLeaveKey{
+		account: event.Account.Mid,
+		chat:    event.Chat.ID,
+		member:  event.GroupEvent.Member.Mid,
+	}
+	now := divaGroupEventNow()
+
+	lc.divaGroupLeaveMu.Lock()
+	for k, marker := range lc.divaGroupLeaves {
+		if now.Sub(marker.receivedAt) >= divaGroupLeaveWindow {
+			delete(lc.divaGroupLeaves, k)
+		}
+	}
+	previous, hasPrevious := lc.divaGroupLeaves[key]
+	admit := true
+	switch event.GroupEvent.Type {
+	case divaGroupEventMemberJoined:
+		delete(lc.divaGroupLeaves, key)
+	case divaGroupEventMemberRemoved, divaGroupEventMemberLeft:
+		if event.GroupEvent.Type == divaGroupEventMemberLeft && hasPrevious &&
+			previous.eventType == divaGroupEventMemberRemoved {
+			admit = false
+			delete(lc.divaGroupLeaves, key)
+			break
+		}
+		if lc.divaGroupLeaves == nil {
+			lc.divaGroupLeaves = make(map[divaGroupLeaveKey]divaGroupLeaveMarker)
+		}
+		lc.divaGroupLeaves[key] = divaGroupLeaveMarker{
+			eventType:  event.GroupEvent.Type,
+			revision:   revision,
+			receivedAt: now,
+		}
+	}
+	lc.divaGroupLeaveMu.Unlock()
+
+	if !admit {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("diva_event", "DIVA_GROUP_EVENT").
+			Str("group_id", key.chat).
+			Str("member_id", key.member).
+			Str("left_revision", revision).
+			Str("matched_removed_revision", previous.revision).
+			Msg("[DIVA_GROUP_EVENT] suppressed trailing member_left")
+		return false
+	}
+	if event.GroupEvent.Type == divaGroupEventMemberRemoved && hasPrevious &&
+		previous.eventType == divaGroupEventMemberLeft {
+		lc.UserLogin.Bridge.Log.Warn().
+			Str("diva_event", "DIVA_GROUP_EVENT").
+			Str("group_id", key.chat).
+			Str("member_id", key.member).
+			Str("removed_revision", revision).
+			Str("previous_left_revision", previous.revision).
+			Msg("[DIVA_GROUP_EVENT] member_removed arrived after member_left; both forwarded")
+	}
+	return true
 }
 
 func (lc *LineClient) handleDIVAInbound(msg *line.Message, chatMID, unwrappedText string, decryptionFailed bool, opType int, origin divaOrigin) {
