@@ -82,6 +82,12 @@ type LineClient struct {
 	paidReactionIconMXC     map[string]string   // LINE sticon URL -> cached MXC URI
 	unblockBackfills        sync.Map            // chat MID -> *unblockBackfillState while unblock history restoration is active
 
+	// divaGroupLeaveMu protects divaGroupLeaves, the short-lived DIVA-only
+	// markers that let a kick's op 133 + op 61 reach DIVA as one member_removed.
+	// It never affects Matrix/Beeper membership handling.
+	divaGroupLeaveMu sync.Mutex
+	divaGroupLeaves  map[divaGroupLeaveKey]divaGroupLeaveMarker
+
 	wg sync.WaitGroup
 }
 
