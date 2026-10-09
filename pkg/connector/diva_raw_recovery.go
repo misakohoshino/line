@@ -408,6 +408,7 @@ func postDIVARawRecovery(ctx context.Context, endpoint string, payload []byte) (
 		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	signDIVAInbound(req, payload)
 	resp, err := divaHTTPClient.Do(req)
 	if err != nil {
 		return false, err

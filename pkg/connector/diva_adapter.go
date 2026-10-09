@@ -628,6 +628,7 @@ func (lc *LineClient) forwardDIVAInbound(encode func() ([]byte, error), mediaLoa
 			return
 		}
 		req.Header.Set("Content-Type", contentType)
+		signDIVAInbound(req, requestBody)
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
