@@ -92,10 +92,18 @@ type LineClient struct {
 	// /diva/v1/status endpoint. It never drives LINE behavior.
 	receiveStatus lineReceiveStatus
 
+	// divaRawRecoveryActive is the single-flight guard for Raw History
+	// recovery passes (startup / fullSync / control-endpoint reconcile). At
+	// most one pass forwards recovered messages to DIVA at a time.
+	divaRawRecoveryActive atomic.Bool
+
 	wg sync.WaitGroup
 }
 
 type lineClientRun struct {
+	// ctx is the run context; background work started for this run (such as a
+	// DIVA raw-history reconcile pass) stops when the run is cancelled.
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -166,7 +174,7 @@ func (lc *LineClient) isSessionInvalidated() bool {
 
 func (lc *LineClient) beginRun(parent context.Context) (context.Context, *lineClientRun, bool) {
 	ctx, cancel := context.WithCancel(parent)
-	run := &lineClientRun{cancel: cancel}
+	run := &lineClientRun{ctx: ctx, cancel: cancel}
 	lc.runMu.Lock()
 	if lc.stopped {
 		lc.runMu.Unlock()
@@ -653,7 +661,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 
 	lc.wg.Add(3)
 	go lc.syncDMChats(ctx)
-	go lc.prefetchMessages(ctx)
+	go lc.prefetchMessages(ctx, divaRawRecoveryTriggerStartup)
 	go lc.pollLoop(ctx)
 	workersStarted = true
 }

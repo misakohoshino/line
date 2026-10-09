@@ -114,6 +114,44 @@ var (
 	runSilentUnblockBackfill = func(ctx context.Context, lc *LineClient, mid string) {
 		lc.silentBackfillRecentMessages(ctx, mid, startupBackfillMessageLimit)
 	}
+
+	// The recent-message backfill seams below keep the production behavior
+	// unchanged; tests replace them to run the pass without LINE or Matrix.
+
+	// listBackfillChatMIDs returns the message box count and the chats a
+	// recent-message pass visits.
+	listBackfillChatMIDs = func(ctx context.Context, lc *LineClient) (int, []string, error) {
+		messageBoxes, err := lc.fetchAllMessageBoxes(ctx, line.MessageBoxesOptions{
+			ActiveOnly:                     true,
+			MessageBoxCountLimit:           messageBoxPageLimit,
+			WithUnreadCount:                true,
+			LastMessagesPerMessageBoxCount: 0,
+		})
+		if err != nil {
+			return 0, nil, err
+		}
+		return len(messageBoxes), collectStartupBackfillChatMIDs(messageBoxes, lc.getKnownMemberChatMIDs(), lc.isUserBlocked), nil
+	}
+	fetchRecentMessagesForBackfill = func(ctx context.Context, lc *LineClient, chatMID string, limit int) ([]*line.Message, error) {
+		_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
+			return client.GetRecentMessagesV2(chatMID, limit)
+		})
+		return msgs, err
+	}
+	// backfillMessageExists reports whether the local Matrix/Beeper DB already
+	// has the message. A lookup error reports false with the error, so the
+	// caller keeps the old behavior of treating the message as new.
+	backfillMessageExists = func(ctx context.Context, lc *LineClient, msgID string) (bool, error) {
+		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msgID), "")
+		return err == nil && existing != nil, err
+	}
+	// queueBackfillMessage queues a message the local DB does not have yet.
+	queueBackfillMessage = func(lc *LineClient, msg *line.Message, opType int) bool {
+		if ContentType(msg.ContentType) == ContentSystem {
+			return lc.queueHistoricalSystemMessage(msg, opType)
+		}
+		return lc.queueIncomingMessage(msg, opType, divaOriginBackfill)
+	}
 )
 
 func (lc *LineClient) getMessageBoxesWithRecovery(ctx context.Context, opts line.MessageBoxesOptions) (*line.MessageBoxesResponse, error) {
@@ -656,35 +694,53 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	}, nil
 }
 
-func (lc *LineClient) prefetchMessages(ctx context.Context) {
+// prefetchMessages is the startup / fullSync recent-message backfill. It
+// bridges messages Matrix has not seen yet and, for messages Matrix already
+// has, runs the DIVA raw-only recovery (see diva_raw_recovery.go).
+func (lc *LineClient) prefetchMessages(ctx context.Context, trigger string) {
 	defer lc.wg.Done()
 
-	opts := line.MessageBoxesOptions{
-		ActiveOnly:                     true,
-		MessageBoxCountLimit:           messageBoxPageLimit,
-		WithUnreadCount:                true,
-		LastMessagesPerMessageBoxCount: 0,
-	}
+	recovery := lc.beginDIVARawRecoveryPass(trigger)
+	defer recovery.finish(lc)
 
-	messageBoxes, err := lc.fetchAllMessageBoxes(ctx, opts)
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to prefetch message boxes")
-		return
+	if lc.runRecentMessagesPass(ctx, false, recovery) && ctx.Err() == nil {
+		// Historical membership/name events are real state events. Replay them in
+		// timestamp order, then restore LINE's current authoritative chat state in
+		// a hidden resync so a truncated recent-message window cannot leave a room
+		// at an old membership or name.
+		lc.syncChatsNow(ctx)
 	}
-	chatMIDs := collectStartupBackfillChatMIDs(messageBoxes, lc.getKnownMemberChatMIDs(), lc.isUserBlocked)
+	// Raw History recovery runs only after the Matrix backfill (and the resync
+	// above) has finished, so waiting on the DIVA worker never delays messages
+	// Matrix is still missing.
+	lc.runDIVARawRecoveryPhase(ctx, recovery)
+}
+
+// runRecentMessagesPass runs backfillRecentMessages for every chat with at
+// most prefetchMessagesConcurrency chats in parallel. Messages Matrix already
+// has are only collected into recovery; runDIVARawRecoveryPhase forwards them
+// afterwards. rawOnly passes (the control-endpoint reconcile) never touch
+// Matrix. It reports whether any historical system event was queued.
+func (lc *LineClient) runRecentMessagesPass(ctx context.Context, rawOnly bool, recovery *divaRawRecoveryPass) bool {
+	messageBoxCount, chatMIDs, err := listBackfillChatMIDs(ctx, lc)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Bool("raw_only", rawOnly).Msg("Failed to prefetch message boxes")
+		return false
+	}
 
 	workerCount := prefetchMessagesConcurrency
 	if len(chatMIDs) < workerCount {
 		workerCount = len(chatMIDs)
 	}
 	if workerCount == 0 {
-		return
+		return false
 	}
 
 	lc.UserLogin.Bridge.Log.Info().
-		Int("message_box_count", len(messageBoxes)).
+		Int("message_box_count", messageBoxCount).
 		Int("chat_count", len(chatMIDs)).
 		Int("concurrency", workerCount).
+		Bool("raw_only", rawOnly).
 		Msg("Prefetching recent messages")
 
 	jobs := make(chan string)
@@ -698,7 +754,7 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				if lc.backfillRecentMessages(ctx, chatMID, startupBackfillMessageLimit) {
+				if lc.backfillRecentMessages(ctx, chatMID, startupBackfillMessageLimit, rawOnly, recovery) {
 					backfilledSystemEvents.Store(true)
 				}
 			}
@@ -710,20 +766,13 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 		case <-ctx.Done():
 			close(jobs)
 			workers.Wait()
-			return
+			return false
 		case jobs <- chatMID:
 		}
 	}
 	close(jobs)
 	workers.Wait()
-
-	// Historical membership/name events are real state events. Replay them in
-	// timestamp order, then restore LINE's current authoritative chat state in
-	// a hidden resync so a truncated recent-message window cannot leave a room
-	// at an old membership or name.
-	if backfilledSystemEvents.Load() && ctx.Err() == nil {
-		lc.syncChatsNow(ctx)
-	}
+	return backfilledSystemEvents.Load()
 }
 
 func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMIDs []string, isBlocked func(string) bool) []string {
@@ -754,29 +803,44 @@ func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMI
 // backfillRecentMessages fetches up to limit recent messages for a single
 // chat and queues any not already in the local DB through the normal inbound
 // (live) message path. Used by prefetchMessages on startup.
-func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) bool {
+//
+// Messages the local DB already has are not queued to Matrix again. They are
+// handed to recovery, whose later raw-only phase lets a Raw History row missed
+// while the DIVA worker or its DB was down still be filled in. With rawOnly
+// set, messages the local DB does not have are left alone (no Matrix queueing,
+// no reaction sync): that pass only exists to fill Raw History gaps.
+func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int, rawOnly bool, recovery *divaRawRecoveryPass) bool {
 	start := time.Now()
-	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
-		return client.GetRecentMessagesV2(chatMID, limit)
-	})
+	msgs, err := fetchRecentMessagesForBackfill(ctx, lc, chatMID, limit)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
 		return false
 	}
+	windowFull := limit > 0 && len(msgs) >= limit
 	queued := 0
 	skippedExisting := 0
+	skippedNotInMatrix := 0
 	reactionSyncs := 0
 	systemEvents := 0
+	var recoverable []divaRawRecoveryItem
 	// Reverse messages to process oldest first
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
 		lc.cacheGroupMembersFromMessage(chatMID, msg)
 
-		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
-		if err == nil && existing != nil {
+		opType := OpReceiveMessage
+		if msg.From == lc.Mid {
+			opType = OpSendMessage
+		}
+
+		exists, err := backfillMessageExists(ctx, lc, msg.ID)
+		if exists {
 			skippedExisting++
-			if lc.queueMessageReactionSync(ctx, chatMID, msg) {
+			if !rawOnly && lc.queueMessageReactionSync(ctx, chatMID, msg) {
 				reactionSyncs++
+			}
+			if recovery.collecting() {
+				recoverable = append(recoverable, divaRawRecoveryItem{msg: msg, opType: int(opType)})
 			}
 			continue
 		} else if err != nil {
@@ -786,17 +850,12 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 				Str("msg_id", msg.ID).
 				Msg("Failed to check whether recent message already exists")
 		}
+		if rawOnly {
+			skippedNotInMatrix++
+			continue
+		}
 
-		opType := OpReceiveMessage
-		if msg.From == lc.Mid {
-			opType = OpSendMessage
-		}
-		var didQueue bool
-		if ContentType(msg.ContentType) == ContentSystem {
-			didQueue = lc.queueHistoricalSystemMessage(msg, int(opType))
-		} else {
-			didQueue = lc.queueIncomingMessage(msg, int(opType), divaOriginBackfill)
-		}
+		didQueue := queueBackfillMessage(lc, msg, int(opType))
 		if didQueue {
 			queued++
 			if ContentType(msg.ContentType) == ContentSystem {
@@ -810,12 +869,17 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 	lc.UserLogin.Bridge.Log.Debug().
 		Str("chat_mid", chatMID).
 		Int("fetched", len(msgs)).
+		Bool("window_full", windowFull).
+		Bool("raw_only", rawOnly).
 		Int("queued", queued).
 		Int("system_events", systemEvents).
 		Int("reaction_syncs", reactionSyncs).
 		Int("skipped_existing", skippedExisting).
+		Int("skipped_not_in_matrix", skippedNotInMatrix).
+		Int("raw_recovery_candidates", len(recoverable)).
 		Dur("duration", time.Since(start)).
 		Msg("Finished recent-message backfill")
+	recovery.addChat(chatMID, windowFull, recoverable)
 	return systemEvents > 0
 }
 
@@ -1608,7 +1672,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			lc.wg.Add(3)
 			go lc.syncChats(ctx)
 			go lc.syncDMChats(ctx)
-			go lc.prefetchMessages(ctx)
+			go lc.prefetchMessages(ctx, divaRawRecoveryTriggerFullSync)
 			return
 		}
 

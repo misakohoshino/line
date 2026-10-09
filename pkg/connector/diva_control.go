@@ -685,6 +685,9 @@ type divaControlConfig struct {
 	resultTTL          time.Duration
 	mediaMaxBytes      int64
 	mediaMaxConcurrent int
+	// startRawReconcile starts one raw-history reconcile pass for a login
+	// (tests replace it); nil uses LineClient.startDIVARawHistoryReconcile.
+	startRawReconcile func(*LineClient) string
 }
 
 // divaRequestEntry is one request_id: in flight until done is closed, then
@@ -760,6 +763,7 @@ func (s *divaControlServer) handler() http.Handler {
 	mux.HandleFunc("/diva/v1/status", s.handleStatus)
 	mux.HandleFunc("/diva/v1/send", s.handleSend)
 	mux.HandleFunc("/diva/v1/send-media", s.handleSendMedia)
+	mux.HandleFunc("/diva/v1/raw-history/reconcile", s.handleRawHistoryReconcile)
 	return mux
 }
 
