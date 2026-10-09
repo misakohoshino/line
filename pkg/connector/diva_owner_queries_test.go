@@ -96,6 +96,7 @@ func TestDIVAOwnerEndpointAuthAccountAndNoSend(t *testing.T) {
 			return nil, nil
 		},
 	})
+	h.env.lc.Mid = "UAccount_fake-90"
 	account := h.env.lc.midOrFallback()
 	for _, tc := range []struct {
 		method, query, token string
@@ -152,5 +153,13 @@ func TestDIVAOwnerEndpointAuthAccountAndNoSend(t *testing.T) {
 	h.s.handler().ServeHTTP(w, r)
 	if w.Code != 503 || strings.Contains(w.Body.String(), "private token") || strings.Contains(w.Body.String(), `"groups":[]`) {
 		t.Fatal("failed query leaked private error or empty success")
+	}
+}
+
+func TestDIVAOwnerExplicitOpaqueAccountSendParsing(t *testing.T) {
+	body := []byte(`{"version":1,"request_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","target":{"chat_id":"CGroup90","account_mid":"UAccount_fake-90"},"message_type":"text","content":{"text":"MID result"}}`)
+	_, job, err := parseDIVASendRequest(body)
+	if err != nil || job.accountMID != "UAccount_fake-90" || job.chatID != "CGroup90" {
+		t.Fatalf("explicit opaque account rejected or changed: %v", err)
 	}
 }

@@ -74,9 +74,9 @@ var (
 	// targets (u/U) refused. The shared send core remains the format authority.
 	divaChatMIDPattern = regexp.MustCompile(`^[cCrR][0-9A-Za-z]+$`)
 	// divaUserMIDPattern accepts LINE user MIDs (target.account_mid) as
-	// opaque identifiers too: Production sender MIDs from msg.From begin with
-	// uppercase U. The MID is passed through unchanged, never lowercased.
-	divaUserMIDPattern = regexp.MustCompile(`^[uU][0-9A-Za-z]+$`)
+	// opaque identifiers too: Production account MIDs use uppercase U and
+	// contain '_' / '-'. The MID is passed through unchanged, never lowercased.
+	divaUserMIDPattern = regexp.MustCompile(`^[uU][0-9A-Za-z_-]+$`)
 	// divaMentionMIDPattern is for relations.mentions[].mid only. Production
 	// sender MIDs copied from msg.From also contain '_' and '-' (for example
 	// UiW5ArR_TzJOkCyAfinglLAO5NXtg-KXLmCkPWuwqv9s). Still user (u/U) MIDs

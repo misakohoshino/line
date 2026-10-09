@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/highesttt/matrix-line-messenger/pkg/line"
-
 	"maunium.net/go/mautrix/bridgev2"
+
+	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
 type divaJoinedGroup struct {
