@@ -1,0 +1,29 @@
+name: OWNER P0 safety tests
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Install libolm
+        run: sudo apt-get update && sudo apt-get install -y libolm-dev
+      - name: Formatting
+        run: test -z "$(gofmt -l pkg/connector/diva_inbound_auth*.go)"
+      - name: Inbound, media, protocol and E2EE regression with race detector
+        run: go test -race ./pkg/connector ./pkg/line ./pkg/e2ee
+      - name: Vet handwritten packages
+        run: go vet $(go list ./... | grep -v /ltsm)
+      - name: Build bridge
+        run: go build -o /tmp/matrix-line ./cmd/matrix-line
