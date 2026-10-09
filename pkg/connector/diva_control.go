@@ -74,9 +74,9 @@ var (
 	// targets (u/U) refused. The shared send core remains the format authority.
 	divaChatMIDPattern = regexp.MustCompile(`^[cCrR][0-9A-Za-z]+$`)
 	// divaUserMIDPattern accepts LINE user MIDs (target.account_mid) as
-	// opaque identifiers too: Production sender MIDs from msg.From begin with
-	// uppercase U. The MID is passed through unchanged, never lowercased.
-	divaUserMIDPattern = regexp.MustCompile(`^[uU][0-9A-Za-z]+$`)
+	// opaque identifiers too: Production account MIDs use uppercase U and
+	// contain '_' / '-'. The MID is passed through unchanged, never lowercased.
+	divaUserMIDPattern = regexp.MustCompile(`^[uU][0-9A-Za-z_-]+$`)
 	// divaMentionMIDPattern is for relations.mentions[].mid only. Production
 	// sender MIDs copied from msg.From also contain '_' and '-' (for example
 	// UiW5ArR_TzJOkCyAfinglLAO5NXtg-KXLmCkPWuwqv9s). Still user (u/U) MIDs
@@ -688,6 +688,7 @@ type divaControlConfig struct {
 	// startRawReconcile starts one raw-history reconcile pass for a login
 	// (tests replace it); nil uses LineClient.startDIVARawHistoryReconcile.
 	startRawReconcile func(*LineClient) string
+	listOwnerGroups   func(context.Context, *LineClient) ([]divaJoinedGroup, error)
 }
 
 // divaRequestEntry is one request_id: in flight until done is closed, then
@@ -700,12 +701,13 @@ type divaRequestEntry struct {
 }
 
 type divaControlServer struct {
-	cfg       divaControlConfig
-	tokenHash [32]byte
-	baseCtx   context.Context
-	cancel    context.CancelFunc
-	sem       chan struct{}
-	mediaSem  chan struct{}
+	cfg           divaControlConfig
+	tokenHash     [32]byte
+	baseCtx       context.Context
+	cancel        context.CancelFunc
+	sem           chan struct{}
+	mediaSem      chan struct{}
+	ownerQuerySem chan struct{}
 
 	mu       sync.Mutex
 	requests map[string]*divaRequestEntry
@@ -746,14 +748,15 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &divaControlServer{
-		cfg:       cfg,
-		tokenHash: sha256.Sum256([]byte(cfg.token)),
-		baseCtx:   ctx,
-		cancel:    cancel,
-		sem:       make(chan struct{}, cfg.maxConcurrent),
-		mediaSem:  make(chan struct{}, cfg.mediaMaxConcurrent),
-		requests:  map[string]*divaRequestEntry{},
-		lanes:     map[string]chan struct{}{},
+		cfg:           cfg,
+		tokenHash:     sha256.Sum256([]byte(cfg.token)),
+		baseCtx:       ctx,
+		cancel:        cancel,
+		sem:           make(chan struct{}, cfg.maxConcurrent),
+		mediaSem:      make(chan struct{}, cfg.mediaMaxConcurrent),
+		ownerQuerySem: make(chan struct{}, 2),
+		requests:      map[string]*divaRequestEntry{},
+		lanes:         map[string]chan struct{}{},
 	}
 }
 
@@ -764,6 +767,7 @@ func (s *divaControlServer) handler() http.Handler {
 	mux.HandleFunc("/diva/v1/send", s.handleSend)
 	mux.HandleFunc("/diva/v1/send-media", s.handleSendMedia)
 	mux.HandleFunc("/diva/v1/raw-history/reconcile", s.handleRawHistoryReconcile)
+	mux.HandleFunc("/diva/v1/owner/joined-groups", s.handleOwnerJoinedGroups)
 	return mux
 }
 

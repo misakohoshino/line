@@ -594,18 +594,22 @@ func (c *Client) GetOwnedProductSummaries(mid string) ([]OwnedProductSummary, er
 }
 
 func (c *Client) GetAllChatMids(withMemberChats, withInvitedChats bool) (*GetAllChatMidsResponse, error) {
+	return c.GetAllChatMidsContext(context.Background(), withMemberChats, withInvitedChats)
+}
+
+func (c *Client) GetAllChatMidsContext(ctx context.Context, withMemberChats, withInvitedChats bool) (*GetAllChatMidsResponse, error) {
 	req := GetAllChatMidsRequest{
 		WithMemberChats:  withMemberChats,
 		WithInvitedChats: withInvitedChats,
 	}
-	resp, err := c.callRPC("TalkService", "getAllChatMids", req, 2)
+	resp, err := c.callRPCContext(ctx, "TalkService", "getAllChatMids", req, 2)
 	if err != nil {
 		return nil, err
 	}
 	var wrapper struct {
-		Code    int                    `json:"code"`
-		Message string                 `json:"message"`
-		Data    GetAllChatMidsResponse `json:"data"`
+		Code    int                     `json:"code"`
+		Message string                  `json:"message"`
+		Data    *GetAllChatMidsResponse `json:"data"`
 	}
 	if err := json.Unmarshal(resp, &wrapper); err != nil {
 		return nil, err
@@ -613,16 +617,23 @@ func (c *Client) GetAllChatMids(withMemberChats, withInvitedChats bool) (*GetAll
 	if wrapper.Code != 0 {
 		return nil, fmt.Errorf("getAllChatMids failed: %s", wrapper.Message)
 	}
-	return &wrapper.Data, nil
+	if wrapper.Data == nil {
+		return nil, fmt.Errorf("getAllChatMids returned no data")
+	}
+	return wrapper.Data, nil
 }
 
 func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetChatsResponse, error) {
+	return c.GetChatsContext(context.Background(), mids, withMembers, withInvitees)
+}
+
+func (c *Client) GetChatsContext(ctx context.Context, mids []string, withMembers, withInvitees bool) (*GetChatsResponse, error) {
 	req := GetChatsRequest{
 		ChatMids:     mids,
 		WithMembers:  withMembers,
 		WithInvitees: withInvitees,
 	}
-	resp, err := c.callRPC("TalkService", "getChats", req, 2)
+	resp, err := c.callRPCContext(ctx, "TalkService", "getChats", req, 2)
 	if err != nil {
 		return nil, err
 	}
