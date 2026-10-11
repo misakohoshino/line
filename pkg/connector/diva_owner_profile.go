@@ -2,8 +2,8 @@ package connector
 
 // OWNER P2 profile writes on the private Docker control endpoint.
 //
-// Only three fixed operations exist: the logged-in Server A account's own
-// display name, status message and profile picture. Callers cannot choose an
+// Only four fixed operations exist: the logged-in Server A account's own
+// display name, status message, profile picture and profile cover. Callers cannot choose an
 // attribute, a target MID, a URL or an RPC method. Every operation is off
 // unless DIVA_OWNER_PROFILE_OPERATIONS lists it. A request_id is executed at
 // most once; a second request with the same request_id and the same payload
@@ -37,6 +37,7 @@ const (
 	divaProfileOperationName   = "profile_name"
 	divaProfileOperationStatus = "profile_status"
 	divaProfileOperationPhoto  = "profile_photo"
+	divaProfileOperationCover  = "profile_cover"
 
 	divaProfileStatePending     = "pending"
 	divaProfileStateConfirmed   = "confirmed"
@@ -71,7 +72,7 @@ const (
 
 var divaProfileReadbackDelay = 1500 * time.Millisecond
 
-var divaProfileOperationOrder = []string{divaProfileOperationName, divaProfileOperationStatus, divaProfileOperationPhoto}
+var divaProfileOperationOrder = []string{divaProfileOperationName, divaProfileOperationStatus, divaProfileOperationPhoto, divaProfileOperationCover}
 
 // parseDIVAProfileOperations reads the comma separated allow list. Any unknown
 // token disables everything (fail closed) instead of guessing.
@@ -84,7 +85,7 @@ func parseDIVAProfileOperations(raw string) (map[string]bool, error) {
 	for _, token := range strings.Split(raw, ",") {
 		token = strings.TrimSpace(token)
 		switch token {
-		case divaProfileOperationName, divaProfileOperationStatus, divaProfileOperationPhoto:
+		case divaProfileOperationName, divaProfileOperationStatus, divaProfileOperationPhoto, divaProfileOperationCover:
 			enabled[token] = true
 		default:
 			return map[string]bool{}, errors.New("unknown profile operation in allow list")
@@ -103,6 +104,39 @@ type divaProfileAPI interface {
 // lineProfileAPI performs single attempts with the current access token. It
 // deliberately bypasses token recovery/re-login: an auth failure is reported.
 type lineProfileAPI struct{}
+
+// The legacy reference has not established Chrome channel approval, Origin
+// or the self cover response schema for this login. Keep candidate writes
+// inaccessible, even if an operator accidentally adds an image to the list.
+func (lineProfileAPI) protocolBlock(operation string) string {
+	if operation == divaProfileOperationPhoto || operation == divaProfileOperationCover {
+		return line.ProfileImageProtocolBlocked
+	}
+	return ""
+}
+
+type divaProfileCoverAPI interface {
+	readCover(context.Context, *LineClient, string) (string, error)
+	uploadCover(context.Context, *LineClient, string, []byte) (*line.ProfileImageUploadResult, error)
+}
+
+func (lineProfileAPI) readCover(ctx context.Context, lc *LineClient, mid string) (string, error) {
+	return lc.newClient().ReadProfileCoverContext(ctx, mid)
+}
+func (lineProfileAPI) uploadCover(ctx context.Context, lc *LineClient, mid string, jpeg []byte) (*line.ProfileImageUploadResult, error) {
+	return lc.newClient().UploadProfileCoverContext(ctx, mid, jpeg)
+}
+func (s *divaControlServer) profileProtocolBlock(operation string) string {
+	if blocker, ok := s.cfg.profileAPI.(interface{ protocolBlock(string) string }); ok {
+		return blocker.protocolBlock(operation)
+	}
+	if operation == divaProfileOperationCover {
+		if _, ok := s.cfg.profileAPI.(divaProfileCoverAPI); !ok {
+			return "PROFILE_COVER_UNSUPPORTED"
+		}
+	}
+	return ""
+}
 
 func (lineProfileAPI) readSelf(ctx context.Context, lc *LineClient) (*line.Profile, error) {
 	return lc.newClient().GetProfileContext(ctx)
@@ -189,7 +223,7 @@ func (s *divaControlServer) profileEnabled(operation string) bool {
 func (s *divaControlServer) enabledProfileOperations() []string {
 	enabled := []string{}
 	for _, operation := range divaProfileOperationOrder {
-		if s.profileEnabled(operation) {
+		if s.profileEnabled(operation) && s.profileProtocolBlock(operation) == "" {
 			enabled = append(enabled, operation)
 		}
 	}
@@ -251,10 +285,19 @@ func (s *divaControlServer) handleOwnerProfileCapabilities(w http.ResponseWriter
 		return
 	}
 	_, selectionError := s.profileLogin(account)
+	blocked := map[string]string{}
+	for _, op := range divaProfileOperationOrder {
+		if code := s.profileProtocolBlock(op); code != "" {
+			blocked[op] = code
+		}
+	}
 	writeDIVAJSON(w, http.StatusOK, map[string]any{
 		"version": divaProfileContractVersion, "ok": true,
-		"account_connected":  selectionError == nil,
-		"enabled_operations": s.enabledProfileOperations(),
+		"account_connected":       selectionError == nil,
+		"enabled_operations":      s.enabledProfileOperations(),
+		"blocked_operations":      blocked,
+		"image_protocol":          "chrline-chrome-legy-candidate",
+		"image_protocol_verified": false,
 	})
 }
 
@@ -350,6 +393,12 @@ func (s *divaControlServer) handleOwnerProfileUpdate(w http.ResponseWriter, r *h
 }
 
 func (s *divaControlServer) handleOwnerProfilePhoto(w http.ResponseWriter, r *http.Request) {
+	s.handleOwnerProfileImage(w, r, divaProfileOperationPhoto)
+}
+func (s *divaControlServer) handleOwnerProfileCover(w http.ResponseWriter, r *http.Request) {
+	s.handleOwnerProfileImage(w, r, divaProfileOperationCover)
+}
+func (s *divaControlServer) handleOwnerProfileImage(w http.ResponseWriter, r *http.Request, operation string) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeDIVAError(w, http.StatusMethodNotAllowed, "", outboundInvalidRequest, "method not allowed")
@@ -387,7 +436,7 @@ func (s *divaControlServer) handleOwnerProfilePhoto(w http.ResponseWriter, r *ht
 		return
 	}
 	if raw.Version == nil || *raw.Version != divaProfileContractVersion || !divaUUIDPattern.MatchString(raw.RequestID) ||
-		!divaUserMIDPattern.MatchString(raw.AccountMID) || raw.Operation != divaProfileOperationPhoto {
+		!divaUserMIDPattern.MatchString(raw.AccountMID) || raw.Operation != operation {
 		writeDIVAError(w, http.StatusBadRequest, raw.RequestID, outboundInvalidRequest, "version, request_id, account_mid and operation are required")
 		return
 	}
@@ -489,6 +538,9 @@ func (s *divaControlServer) submitProfile(reqCtx context.Context, job *divaProfi
 
 	if !s.profileEnabled(job.operation) {
 		return divaProfileRejection(job.requestID, job.operation, "PROFILE_OPERATION_DISABLED"), http.StatusForbidden
+	}
+	if code := s.profileProtocolBlock(job.operation); code != "" {
+		return divaProfileRejection(job.requestID, job.operation, code), http.StatusForbidden
 	}
 	lc, selectionError := s.profileLogin(job.accountMID)
 	if selectionError != nil {
@@ -607,6 +659,9 @@ func (s *divaControlServer) executeProfile(ctx context.Context, job *divaProfile
 	if ctx.Err() != nil {
 		return notSent("PROFILE_SHUTTING_DOWN")
 	}
+	if code := s.profileProtocolBlock(job.operation); code != "" {
+		return notSent(code)
+	}
 	before, ok := s.readSelfProfile(ctx, lc, job.accountMID)
 	if !ok {
 		return notSent("PROFILE_SELF_VERIFY_FAILED")
@@ -630,6 +685,73 @@ func (s *divaControlServer) executeProfile(ctx context.Context, job *divaProfile
 		}
 		matches = func(p *line.Profile) bool { return read(p) == job.value }
 		writeErr = s.cfg.profileAPI.updateAttribute(writeCtx, lc, attribute, job.value)
+	case divaProfileOperationCover:
+		coverAPI, ok := s.cfg.profileAPI.(divaProfileCoverAPI)
+		if !ok {
+			cancelWrite()
+			return notSent("PROFILE_COVER_UNSUPPORTED")
+		}
+		// A reliable fresh baseline must exist before any upload.
+		readCtx, cancel := context.WithTimeout(ctx, divaProfileReadTimeout)
+		_, err := coverAPI.readCover(readCtx, lc, job.accountMID)
+		cancel()
+		if err != nil {
+			cancelWrite()
+			return notSent("PROFILE_COVER_SELF_VERIFY_FAILED")
+		}
+		uploaded, err := coverAPI.uploadCover(writeCtx, lc, job.accountMID, job.image)
+		writeErr = err
+		cancelWrite()
+		if writeErr != nil {
+			outcome, code := line.ProfileWriteOutcomeOf(writeErr)
+			result.Code = code
+			result.httpStatus = line.ProfileWriteHTTPStatus(writeErr)
+			switch outcome {
+			case line.ProfileWriteNotSent:
+				result.State = divaProfileStateNotSent
+				return result
+			case line.ProfileWriteRejected:
+				result.State, result.Write = divaProfileStateRejected, divaProfileWriteRejected
+				return result
+			default:
+				result.State, result.Write = divaProfileStateUnknown, divaProfileWriteUnknown
+				return result
+			}
+		}
+		result.Write, result.Readback = divaProfileWriteAccepted, divaProfileReadbackUnavailable
+		if uploaded == nil || uploaded.ObjectID == "" {
+			result.State = divaProfileStateUnknown
+			result.Code = "PROFILE_COVER_UPLOAD_RESULT_INVALID"
+			return result
+		}
+		// Upload + association is still not proof. Fresh self-scoped object
+		// ID must match exactly, not just a changed thumbnail or public URL.
+		for attempt := 0; attempt < divaProfileReadbackTries; attempt++ {
+			if ctx.Err() != nil {
+				break
+			}
+			if attempt > 0 {
+				timer := time.NewTimer(divaProfileReadbackDelay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+				}
+			}
+			readCtx, cancel := context.WithTimeout(ctx, divaProfileReadTimeout)
+			oid, err := coverAPI.readCover(readCtx, lc, job.accountMID)
+			cancel()
+			if err != nil {
+				continue
+			}
+			result.Readback = divaProfileReadbackMismatch
+			if oid == uploaded.ObjectID {
+				result.State, result.Readback = divaProfileStateConfirmed, divaProfileReadbackMatch
+				return result
+			}
+		}
+		result.State, result.Code = divaProfileStateUnconfirmed, "PROFILE_COVER_READBACK_NOT_CONFIRMED"
+		return result
 	case divaProfileOperationPhoto:
 		// A changed picture marker is required; HTTP 200 or OBS identifiers alone
 		// are not success. An unchanged marker stays unconfirmed.

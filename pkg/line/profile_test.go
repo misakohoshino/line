@@ -248,11 +248,10 @@ func TestUploadProfileImageUsesPersonalPathAndStrictResponse(t *testing.T) {
 	} {
 		requests := 0
 		client := NewClient("main-token")
-		client.HTTPClient = noRPCClient(t)
-		installProfileChannelToken(client)
+		client.HTTPClient = profileApprovalClient(t)
 		client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			requests++
-			if req.Method != http.MethodPost || req.URL.Host != "obs.line-apps.com" || req.URL.Path != "/r/talk/p/UAccount_fake-90" {
+			if req.Method != http.MethodPost || req.URL.Host != "gwz.line.naver.jp" || req.URL.Path != "/oa/r/talk/p/UAccount_fake-90" {
 				t.Fatalf("unexpected upload target %s %s", req.Method, req.URL)
 			}
 			params, _ := base64.StdEncoding.DecodeString(req.Header.Get("X-Obs-Params"))
@@ -261,7 +260,7 @@ func TestUploadProfileImageUsesPersonalPathAndStrictResponse(t *testing.T) {
 				string(meta) != `{"profileContext":{"storyShare":false}}` ||
 				req.Header.Get("X-Line-ChannelToken") != "channel-token" || req.Header.Get("x-line-access") != "main-token" ||
 				req.Header.Get("X-Line-Mid") != "UAccount_fake-90" ||
-				req.Header.Get("Content-Type") != "image/jpeg" {
+				req.Header.Get("Content-Type") != "image/gif" {
 				t.Fatalf("unexpected profile upload headers: %v params=%s meta=%s", req.Header, params, meta)
 			}
 			body, _ := io.ReadAll(req.Body)
@@ -339,7 +338,7 @@ func TestUploadProfileImageTokenUnavailableIsNotSent(t *testing.T) {
 	client = NewClient("main-token")
 	client.OBSClient = noOBS
 	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if !strings.HasSuffix(req.URL.Path, "/ChannelService/issueChannelToken") {
+		if !strings.HasSuffix(req.URL.Path, "/ChannelService/approveChannelAndIssueChannelToken") {
 			t.Fatalf("unexpected RPC %s", req.URL.Path)
 		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"code":1,"message":"channel not approved"}`))}, nil
