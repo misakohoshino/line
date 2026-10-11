@@ -11,7 +11,6 @@ package line
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -311,50 +310,36 @@ type ProfileImageUploadResult struct {
 	channelToken string // private, in-memory candidate authorization only
 }
 
-// UploadProfileImageContext uses CHRLINE's LEGY candidate, never the old
-// direct OBS host. Compatibility with DIVA's Chrome session is unverified;
-// the production connector blocks this candidate before any network call.
+// UploadProfileImageContext uses the Chrome extension's own authenticated
+// gateway upload, not the legacy LEGY proxy or the direct OBS talk/p path.
+// The gateway owns the object identifiers; this write is not confirmed until
+// the connector freshly reads a changed pictureStatus or picturePath.
 func (c *Client) UploadProfileImageContext(ctx context.Context, selfMid string, jpegData []byte) (*ProfileImageUploadResult, error) {
-	return c.uploadProfileObjectContext(ctx, selfMid, jpegData, "talk/p/"+url.PathEscape(selfMid), "profile.jpg", true)
-}
-
-func (c *Client) uploadProfileObjectContext(ctx context.Context, selfMid string, jpegData []byte, path, filename string, photo bool) (*ProfileImageUploadResult, error) {
 	if !profileSelfMIDPattern.MatchString(selfMid) {
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_SELF_MID_INVALID", nil)
 	}
 	if len(jpegData) == 0 || len(jpegData) > profileImageMaxOutput || !bytes.HasPrefix(jpegData, []byte{0xff, 0xd8, 0xff}) {
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_IMAGE_INVALID", nil)
 	}
-	channelToken, err := c.acquireProfileChannelTokenContext(ctx)
-	if err != nil {
-		return nil, err
+	if c.AccessToken == "" {
+		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_ACCESS_TOKEN_UNAVAILABLE", nil)
 	}
-	params, _ := json.Marshal(map[string]string{"name": filename, "type": "image", "ver": "2.0"})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, profileLEGYBaseURL+"/oa/r/"+path, bytes.NewReader(jpegData))
+	target := profileChromeGatewayBaseURL + "/api/obs/uploadProfile?" + url.Values{"mid": {selfMid}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(jpegData))
 	if err != nil {
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_REQUEST_BUILD_FAILED", nil)
 	}
-	setProfileCandidateHeaders(req, c.AccessToken, selfMid, channelToken, false)
-	// CHRLINE's bytes-upload contract declares image/gif even for JPEG bytes.
-	// This is isolated to the candidate, not transplanted into chat media.
-	req.Header.Set("Content-Type", "image/gif")
-	req.Header.Set("X-Obs-Params", base64.StdEncoding.EncodeToString(params))
-	if photo {
-		meta, _ := json.Marshal(map[string]any{"profileContext": map[string]bool{"storyShare": false}})
-		req.Header.Set("X-Talk-Meta", base64.StdEncoding.EncodeToString(meta))
-	}
-	resp, err := profileCandidateClient(c.obsHTTPClient()).Do(req)
+	setChromeProfileGatewayHeaders(req, c.AccessToken, "")
+	req.Header.Set("Content-Type", "image/jpeg")
+	// No channel token, X-Line-Mid or raw OBS X-Obs-Params: the Chrome
+	// extension uploads profile pictures with its ordinary gateway credentials.
+	resp, err := profileCandidateClient(c.HTTPClient).Do(req)
 	if err != nil {
-		return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_OBS_TRANSPORT_UNKNOWN", nil)
+		return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_IMAGE_TRANSPORT_UNKNOWN", nil)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	if err := classifyProfileHTTP(resp, "PROFILE_OBS"); err != nil {
+	if _, err = readChromeProfileGatewayResponse(resp, "PROFILE_IMAGE"); err != nil {
 		return nil, err
 	}
-	oid, hash := resp.Header.Get("x-obs-oid"), resp.Header.Get("x-obs-hash")
-	if !profileOBSValue.MatchString(oid) || !profileOBSValue.MatchString(hash) {
-		return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_OBS_RESPONSE_INVALID", nil)
-	}
-	return &ProfileImageUploadResult{ObjectID: oid, Hash: hash, channelToken: channelToken}, nil
+	return &ProfileImageUploadResult{}, nil
 }
