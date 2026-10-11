@@ -264,21 +264,35 @@ func TestUploadProfileImageChromeGatewayRequestAndOutcomes(t *testing.T) {
 					t.Fatal("unexpected Chrome profile upload request")
 				}
 				body, _ := io.ReadAll(req.Body)
-				if !bytes.Equal(body, jpegData) { t.Fatal("upload body changed") }
-				if tc.network != nil { return nil, tc.network }
+				if !bytes.Equal(body, jpegData) {
+					t.Fatal("upload body changed")
+				}
+				if tc.network != nil {
+					return nil, tc.network
+				}
 				r := obsResponse(tc.status, tc.response)
-				if tc.status == 307 { r.Header.Set("Location", "https://invalid.example/steal") }
+				if tc.status == 307 {
+					r.Header.Set("Location", "https://invalid.example/steal")
+				}
 				return r, nil
 			})}
 			client.OBSClient = noRPCClient(t)
 			result, err := client.UploadProfileImageContext(context.Background(), "UAccount_fake-90", jpegData)
-			if count != 1 { t.Fatalf("requests=%d: must not retry", count) }
+			if count != 1 {
+				t.Fatalf("requests=%d: must not retry", count)
+			}
 			if tc.outcome == "" {
-				if err != nil || result == nil { t.Fatalf("expected gateway acceptance, got %v", err) }
+				if err != nil || result == nil {
+					t.Fatalf("expected gateway acceptance, got %v", err)
+				}
 			} else {
 				outcome, _ := ProfileWriteOutcomeOf(err)
-				if err == nil || outcome != tc.outcome { t.Fatalf("outcome=%s err=%v", outcome, err) }
-				if tc.status == 401 && ProfileWriteHTTPStatus(err) != 401 { t.Fatal("missing HTTP status") }
+				if err == nil || outcome != tc.outcome {
+					t.Fatalf("outcome=%s err=%v", outcome, err)
+				}
+				if tc.status == 401 && ProfileWriteHTTPStatus(err) != 401 {
+					t.Fatal("missing HTTP status")
+				}
 			}
 		})
 	}
@@ -289,7 +303,10 @@ func TestUploadProfileImageNeverUploadsOtherAccountOrUnsafeBytes(t *testing.T) {
 	client := NewClient("main-token")
 	client.HTTPClient = noRPCClient(t)
 	client.OBSClient = noRPCClient(t)
-	for _, tc := range []struct { mid string; data []byte }{
+	for _, tc := range []struct {
+		mid  string
+		data []byte
+	}{
 		{"cGroup", jpeg}, {"u/../secret", jpeg}, {"", jpeg},
 		{"UAccount", encodeTestImage(t, "png", 8, 8)}, {"UAccount", nil},
 	} {
