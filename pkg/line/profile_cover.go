@@ -198,27 +198,42 @@ func (c *Client) profileCoverRequest(ctx context.Context, mid, region, channel, 
 // getCover gateway data is not guaranteed to echo homeId. Require a fresh
 // authenticated self-only request; if the response does echo identity, it must
 // agree exactly. Unknown schemas remain unconfirmed, never guessed.
+// Two documented Chrome-family response shapes exist: the full
+// coverObsInfo {objectId,obsNamespace,serviceName} and the Chrome SDK
+// shorthand {oid,sid}. Reject contradictory fields rather than guessing.
+// Sources: NiceDayZc/OkLine media.md @ 2e343797; nezumi0627/vyline
+// lineService.ts @ e34cbd51 (the latter independently live-verified
+// coverObsInfo fields in 2026-08, but on a different LINE endpoint).
 func parseProfileCover(raw []byte, mid string) (string, error) {
 	var obj struct {
-		HomeID string `json:"homeId"`
-		Cover  struct {
+		HomeID         string `json:"homeId"`
+		IsDefaultCover bool   `json:"isDefaultCover"`
+		Cover          struct {
 			Service   string `json:"serviceName"`
 			Namespace string `json:"obsNamespace"`
 			ObjectID  string `json:"objectId"`
+			OID       string `json:"oid"`
+			SID       string `json:"sid"`
 		} `json:"coverObsInfo"`
 	}
 	if json.Unmarshal(raw, &obj) != nil {
 		return "", profileWriteError(ProfileWriteUnknown, "PROFILE_COVER_RESPONSE_INVALID", nil)
 	}
-	if obj.HomeID != "" && obj.HomeID != mid {
-		return "", profileWriteError(ProfileWriteUnknown, "PROFILE_COVER_SELF_READBACK_UNVERIFIED", nil)
-	}
-	if obj.Cover.Service != "" && obj.Cover.Service != "myhome" ||
+	if obj.IsDefaultCover || obj.HomeID != "" && obj.HomeID != mid ||
+		obj.Cover.Service != "" && obj.Cover.Service != "myhome" ||
 		obj.Cover.Namespace != "" && obj.Cover.Namespace != "c" ||
-		!profileOBSValue.MatchString(obj.Cover.ObjectID) {
+		obj.Cover.SID != "" && obj.Cover.SID != "c" ||
+		obj.Cover.ObjectID != "" && obj.Cover.OID != "" && obj.Cover.ObjectID != obj.Cover.OID {
 		return "", profileWriteError(ProfileWriteUnknown, "PROFILE_COVER_SELF_READBACK_UNVERIFIED", nil)
 	}
-	return obj.Cover.ObjectID, nil
+	oid := obj.Cover.ObjectID
+	if oid == "" {
+		oid = obj.Cover.OID
+	}
+	if !profileOBSValue.MatchString(oid) {
+		return "", profileWriteError(ProfileWriteUnknown, "PROFILE_COVER_SELF_READBACK_UNVERIFIED", nil)
+	}
+	return oid, nil
 }
 
 func (c *Client) ReadProfileCoverContext(ctx context.Context, mid string) (string, error) {
