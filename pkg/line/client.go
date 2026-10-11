@@ -348,8 +348,6 @@ func (c *Client) callRPCWithBaseURL(baseURL, service, method string, args ...int
 }
 
 func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service, method string, args ...interface{}) ([]byte, error) {
-	url := fmt.Sprintf("%s/%s/%s", baseURL, service, method)
-
 	var bodyBytes []byte
 	if len(args) == 0 {
 		bodyBytes = []byte("[]")
@@ -360,6 +358,31 @@ func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service
 			return nil, fmt.Errorf("failed to marshal args: %w", err)
 		}
 	}
+
+	req, err := c.newSignedRPCRequest(ctx, baseURL, service, method, bodyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return respBody, nil
+}
+
+// newSignedRPCRequest builds one Chrome gateway JSON request with the existing
+// access token headers and HMAC runner. It never sends the request.
+func (c *Client) newSignedRPCRequest(ctx context.Context, baseURL, service, method string, bodyBytes []byte) (*http.Request, error) {
+	url := fmt.Sprintf("%s/%s/%s", baseURL, service, method)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(bodyBytes))
 	if err != nil {
@@ -386,20 +409,7 @@ func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service
 		return nil, fmt.Errorf("failed to generate HMAC signature: %w", err)
 	}
 	req.Header.Set("x-hmac", signature)
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	return respBody, nil
+	return req, nil
 }
 
 // ConfirmE2EELogin completes the E2EE handshake after LF1 by hashing the encrypted key

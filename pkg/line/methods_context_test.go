@@ -6,10 +6,18 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	gen "github.com/highesttt/matrix-line-messenger/pkg"
 )
 
 func testRPCContextCancellation(t *testing.T, method string, call func(*Client, context.Context) error) {
 	t.Helper()
+	// The first signed request initializes the WASM HMAC runner, which can take
+	// longer than the 1 s start budget below under -race. Warm it up first so
+	// the test measures only context cancellation.
+	if _, err := gen.GetRunner(); err != nil {
+		t.Fatal(err)
+	}
 	requestStarted := make(chan struct{})
 	client := NewClient("valid-token")
 	client.HTTPClient = &http.Client{
