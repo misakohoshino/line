@@ -92,14 +92,19 @@ func TestDIVAProfileCoverRequiresAssociationAndExactFreshSelfObject(t *testing.T
 	}
 }
 
-func TestDIVAProfileProductionCandidateBlockedEvenIfConfigured(t *testing.T) {
+func TestDIVAProfileProductionCoverOnlyWithExplicitOperationAllowList(t *testing.T) {
 	base := &fakeProfileAPI{profiles: []*line.Profile{profileSelf("名", "簽名", "photo")}}
-	h := profileHarness(t, base, divaProfileOperationName, divaProfileOperationPhoto, divaProfileOperationCover)
+	// Normal production posture still blocks cover, even when the native
+	// adapter supports it. No LINE call is allowed without explicit opt-in.
+	h := profileHarness(t, base, divaProfileOperationName, divaProfileOperationPhoto)
 	h.s.cfg.profileAPI = lineProfileAPI{}
 	status, result := postProfilePhoto(t, h, coverMetadata(newDIVARequestID()), profilePNG(t), false)
-	if status != 403 || result.Code != line.ProfileImageProtocolBlocked || result.State != divaProfileStateNotSent {
-		t.Fatalf("unverified production route executed: %d %+v", status, result)
+	if status != http.StatusForbidden || result.Code != "PROFILE_OPERATION_DISABLED" || result.State != divaProfileStateNotSent {
+		t.Fatalf("cover unexpectedly admitted with flag OFF: %d %+v", status, result)
 	}
+	// The bridge may advertise cover as eligible only when explicitly
+	// configured. This does not write any image or claim LINE E2E success.
+	h.s.cfg.profileOperations[divaProfileOperationCover] = true
 	r := httptest.NewRequest(http.MethodGet, "/diva/v1/owner/profile/capabilities?account_mid="+divaProfileTestAccount, nil)
 	r.Header.Set("Authorization", "Bearer "+divaTestToken)
 	w := httptest.NewRecorder()
@@ -109,10 +114,12 @@ func TestDIVAProfileProductionCandidateBlockedEvenIfConfigured(t *testing.T) {
 		Blocked map[string]string `json:"blocked_operations"`
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &data)
-	if len(data.Enabled) != 2 || data.Enabled[0] != divaProfileOperationName ||
-		data.Enabled[1] != divaProfileOperationPhoto || len(data.Blocked) != 1 ||
-		data.Blocked[divaProfileOperationCover] != line.ProfileImageProtocolBlocked {
-		t.Fatalf("Chrome avatar candidate / blocked cover capabilities incorrect: %s", w.Body.String())
+	if len(data.Enabled) != 3 ||
+		data.Enabled[0] != divaProfileOperationName ||
+		data.Enabled[1] != divaProfileOperationPhoto ||
+		data.Enabled[2] != divaProfileOperationCover ||
+		len(data.Blocked) != 0 {
+		t.Fatalf("explicit cover gate not reflected in capabilities: %s", w.Body.String())
 	}
 }
 
