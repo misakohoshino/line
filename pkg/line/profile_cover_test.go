@@ -118,6 +118,33 @@ func TestChromeCoverRejectsWrongSelfAndUnprovenReadback(t *testing.T) {
 	}
 }
 
+func TestChromeCoverDocumentedReadbackVariants(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+		want string
+	}{
+		{"full verified shape", `{"homeId":"USelf","coverObsInfo":{"objectId":"new_cover","obsNamespace":"c","serviceName":"myhome"}}`, "new_cover"},
+		{"Chrome oid/sid", `{"coverObsInfo":{"oid":"new_cover","sid":"c"}}`, "new_cover"},
+		{"both matching", `{"coverObsInfo":{"oid":"new_cover","objectId":"new_cover","sid":"c","obsNamespace":"c"}}`, "new_cover"},
+		{"contradictory IDs", `{"coverObsInfo":{"objectId":"old","oid":"new"}}`, ""},
+		{"unexpected storage", `{"coverObsInfo":{"oid":"new_cover","sid":"p"}}`, ""},
+		{"default cover", `{"isDefaultCover":true,"coverObsInfo":{"objectId":"new_cover"}}`, ""},
+		{"wrong identity", `{"homeId":"UOther","coverObsInfo":{"oid":"new_cover","sid":"c"}}`, ""},
+		{"empty oid", `{"coverObsInfo":{"oid":""}}`, ""},
+		{"unsafe oid", `{"coverObsInfo":{"oid":"../new"}}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseProfileCover([]byte(tc.data), "USelf")
+			if tc.want == "" {
+				if err == nil { t.Fatalf("accepted ambiguous cover %q", got) }
+				return
+			}
+			if err != nil || got != tc.want { t.Fatalf("got %q err %v", got, err) }
+		})
+	}
+}
+
 func TestChromeCoverUploadFailureStopsBeforeAssociation(t *testing.T) {
 	for _, status := range []int{401, 403, 500, 307} {
 		client := NewClient("main-token")
