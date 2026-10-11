@@ -789,6 +789,7 @@ func (s *divaControlServer) handler() http.Handler {
 	mux.HandleFunc("/diva/v1/owner/profile/self", s.handleOwnerProfileSelf)
 	mux.HandleFunc("/diva/v1/owner/profile/update", s.handleOwnerProfileUpdate)
 	mux.HandleFunc("/diva/v1/owner/profile/photo", s.handleOwnerProfilePhoto)
+	mux.HandleFunc("/diva/v1/owner/profile/cover", s.handleOwnerProfileCover)
 	mux.HandleFunc("/diva/v1/owner/profile/result", s.handleOwnerProfileResult)
 	return mux
 }

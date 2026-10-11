@@ -319,7 +319,11 @@ func postProfilePhoto(t *testing.T, h *divaControlHarness, metadata map[string]a
 		_, _ = extraPart.Write([]byte("https://example.invalid/a.jpg"))
 	}
 	_ = writer.Close()
-	r := httptest.NewRequest(http.MethodPost, "/diva/v1/owner/profile/photo", &body)
+	route := "photo"
+	if metadata["operation"] == divaProfileOperationCover {
+		route = "cover"
+	}
+	r := httptest.NewRequest(http.MethodPost, "/diva/v1/owner/profile/"+route, &body)
 	r.Header.Set("Content-Type", writer.FormDataContentType())
 	r.Header.Set("Authorization", "Bearer "+divaTestToken)
 	w := httptest.NewRecorder()

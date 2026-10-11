@@ -41,8 +41,8 @@ const (
 	ProfileStatusMessageMaxUnits = 500
 
 	// ProfileImageChannelID is the LINE channel used by CHRLINE's personal
-	// profile image upload. The same channel token is already issued through
-	// ChannelService by the existing album preview download.
+	// profile image upload. The candidate uses explicit channel approval; it
+	// does not assume album token issuance proves approval compatibility.
 	ProfileImageChannelID     = albumPreviewChannelID
 	ProfileImageMaxInputBytes = 10 << 20
 	ProfileImageMaxSide       = 4096
@@ -306,73 +306,55 @@ func pngIsAnimated(data []byte) (animated bool, ok bool) {
 
 // ProfileImageUploadResult carries the OBS identifiers returned by LINE.
 type ProfileImageUploadResult struct {
-	ObjectID string
-	Hash     string
+	ObjectID     string
+	Hash         string
+	channelToken string // private, in-memory candidate authorization only
 }
 
-// UploadProfileImageContext uploads one already normalized JPEG to the
-// account's own personal profile path talk/p/{selfMid}. One attempt only; the
-// caller must verify the result by reading the profile back.
-//
-// Authorization follows the CHROMEOS profile-image contract: the main access
-// token in X-Line-Access plus X-Line-Mid (self) and the channel token. CHRLINE
-// (object.py Hraders4Obs) uses the encrypted OBS token only for non-CHROMEOS
-// devices, and the existing album preview download (Chrome channel token +
-// main access token) follows the same pattern. The encrypted OBS token used
-// by chat media (talk/m) is not used here.
+// UploadProfileImageContext uses CHRLINE's LEGY candidate, never the old
+// direct OBS host. Compatibility with DIVA's Chrome session is unverified;
+// the production connector blocks this candidate before any network call.
 func (c *Client) UploadProfileImageContext(ctx context.Context, selfMid string, jpegData []byte) (*ProfileImageUploadResult, error) {
+	return c.uploadProfileObjectContext(ctx, selfMid, jpegData, "talk/p/"+url.PathEscape(selfMid), "profile.jpg", true)
+}
+
+func (c *Client) uploadProfileObjectContext(ctx context.Context, selfMid string, jpegData []byte, path, filename string, photo bool) (*ProfileImageUploadResult, error) {
 	if !profileSelfMIDPattern.MatchString(selfMid) {
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_SELF_MID_INVALID", nil)
 	}
 	if len(jpegData) == 0 || len(jpegData) > profileImageMaxOutput || !bytes.HasPrefix(jpegData, []byte{0xff, 0xd8, 0xff}) {
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_IMAGE_INVALID", nil)
 	}
-	if c.AccessToken == "" {
-		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_ACCESS_TOKEN_UNAVAILABLE", nil)
-	}
-	channelToken, err := c.AcquireChannelAccessToken(ProfileImageChannelID)
+	channelToken, err := c.acquireProfileChannelTokenContext(ctx)
 	if err != nil {
-		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_CHANNEL_TOKEN_UNAVAILABLE", err)
+		return nil, err
 	}
-	params, _ := json.Marshal(map[string]string{"name": "profile.jpg", "type": "image", "ver": "2.0"})
-	talkMeta, _ := json.Marshal(map[string]any{"profileContext": map[string]bool{"storyShare": false}})
-	requestURL := fmt.Sprintf("%s/r/talk/p/%s", OBSBaseURL, url.PathEscape(selfMid))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(jpegData))
+	params, _ := json.Marshal(map[string]string{"name": filename, "type": "image", "ver": "2.0"})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, profileLEGYBaseURL+"/oa/r/"+path, bytes.NewReader(jpegData))
 	if err != nil {
-		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_REQUEST_BUILD_FAILED", err)
+		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_REQUEST_BUILD_FAILED", nil)
 	}
-	req.Header.Set("User-Agent", UserAgent)
-	req.Header.Set("x-line-application", lineApplicationHeader)
-	req.Header.Set("x-lal", "en_US")
-	req.Header.Set("Content-Type", "image/jpeg")
+	setProfileCandidateHeaders(req, c.AccessToken, selfMid, channelToken, false)
+	// CHRLINE's bytes-upload contract declares image/gif even for JPEG bytes.
+	// This is isolated to the candidate, not transplanted into chat media.
+	req.Header.Set("Content-Type", "image/gif")
 	req.Header.Set("X-Obs-Params", base64.StdEncoding.EncodeToString(params))
-	req.Header.Set("X-Talk-Meta", base64.StdEncoding.EncodeToString(talkMeta))
-	req.Header.Set("x-line-access", c.AccessToken)
-	req.Header.Set("X-Line-Mid", selfMid)
-	req.Header.Set("X-Line-ChannelToken", channelToken)
-
-	resp, err := c.obsHTTPClient().Do(req)
+	if photo {
+		meta, _ := json.Marshal(map[string]any{"profileContext": map[string]bool{"storyShare": false}})
+		req.Header.Set("X-Talk-Meta", base64.StdEncoding.EncodeToString(meta))
+	}
+	resp, err := profileCandidateClient(c.obsHTTPClient()).Do(req)
 	if err != nil {
-		return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_OBS_TRANSPORT_UNKNOWN", err)
+		return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_OBS_TRANSPORT_UNKNOWN", nil)
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	switch {
-	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		// OBS refused this upload's authorization. This is not, by itself, a
-		// signal that the LINE session is invalid (text profile writes work).
-		return nil, profileHTTPError(ProfileWriteRejected, "PROFILE_OBS_UNAUTHORIZED", resp.StatusCode)
-	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		return nil, profileHTTPError(ProfileWriteRejected, "PROFILE_OBS_REJECTED", resp.StatusCode)
-	default:
-		return nil, profileHTTPError(ProfileWriteUnknown, "PROFILE_OBS_HTTP_UNKNOWN", resp.StatusCode)
+	if err := classifyProfileHTTP(resp, "PROFILE_OBS"); err != nil {
+		return nil, err
 	}
-	oid := resp.Header.Get("x-obs-oid")
-	hash := resp.Header.Get("x-obs-hash")
+	oid, hash := resp.Header.Get("x-obs-oid"), resp.Header.Get("x-obs-hash")
 	if !profileOBSValue.MatchString(oid) || !profileOBSValue.MatchString(hash) {
-		// 2xx without the documented identifiers: LINE may have stored it.
 		return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_OBS_RESPONSE_INVALID", nil)
 	}
-	return &ProfileImageUploadResult{ObjectID: oid, Hash: hash}, nil
+	return &ProfileImageUploadResult{ObjectID: oid, Hash: hash, channelToken: channelToken}, nil
 }
