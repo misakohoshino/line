@@ -317,7 +317,9 @@ func (lineProfileAPI) inspectCover(ctx context.Context, lc *LineClient, selfMID 
 // Never returns raw LINE JSON, MID, token, cover ID, or images.
 func (s *divaControlServer) handleOwnerProfileCoverInspect(w http.ResponseWriter, r *http.Request) {
 	_, account, ok := s.profileAccountQuery(w, r)
-	if !ok { return }
+	if !ok {
+		return
+	}
 	lc, selectErr := s.profileLogin(account)
 	if selectErr != nil {
 		writeDIVAError(w, selectErr.status, "", selectErr.code, selectErr.detail)
@@ -341,14 +343,16 @@ func (s *divaControlServer) handleOwnerProfileCoverInspect(w http.ResponseWriter
 	code := ""
 	if err != nil {
 		_, code = line.ProfileWriteOutcomeOf(err)
-		if code == "" { code = "PROFILE_COVER_INSPECT_UNAVAILABLE" }
+		if code == "" {
+			code = "PROFILE_COVER_INSPECT_UNAVAILABLE"
+		}
 	}
 	writeDIVAJSON(w, http.StatusOK, map[string]any{
-		"version": divaProfileContractVersion,
-		"ok": err == nil,
+		"version":   divaProfileContractVersion,
+		"ok":        err == nil,
 		"read_only": true,
-		"schema": info,
-		"code": code,
+		"schema":    info,
+		"code":      code,
 	})
 }
 
