@@ -216,8 +216,16 @@ func installProfileChannelToken(client *Client) {
 	}
 }
 
+// noRPCClient fails the test if anything (for example the encrypted OBS token
+// acquisition used by chat media) is sent to the Talk RPC gateway.
+func noRPCClient(t *testing.T) *http.Client {
+	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("profile upload must not call Talk RPC %s", req.URL.Path)
+		return nil, nil
+	})}
+}
+
 func TestUploadProfileImageUsesPersonalPathAndStrictResponse(t *testing.T) {
-	installCachedOBSToken(t)
 	jpegData := encodeTestImage(t, "jpeg", 8, 8)
 	for _, tc := range []struct {
 		name    string
@@ -233,11 +241,14 @@ func TestUploadProfileImageUsesPersonalPathAndStrictResponse(t *testing.T) {
 		{"200 without hash", 200, map[string]string{"x-obs-oid": "oid_1"}, nil, ProfileWriteUnknown, false},
 		{"bad identifier", 201, map[string]string{"x-obs-oid": "../x", "x-obs-hash": "h"}, nil, ProfileWriteUnknown, false},
 		{"forbidden", 403, nil, nil, ProfileWriteRejected, false},
+		{"unauthorized", 401, nil, nil, ProfileWriteRejected, false},
+		{"bad request", 400, nil, nil, ProfileWriteRejected, false},
 		{"server error", 500, nil, nil, ProfileWriteUnknown, false},
 		{"timeout", 0, nil, context.DeadlineExceeded, ProfileWriteUnknown, false},
 	} {
 		requests := 0
 		client := NewClient("main-token")
+		client.HTTPClient = noRPCClient(t)
 		installProfileChannelToken(client)
 		client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			requests++
@@ -248,7 +259,8 @@ func TestUploadProfileImageUsesPersonalPathAndStrictResponse(t *testing.T) {
 			meta, _ := base64.StdEncoding.DecodeString(req.Header.Get("X-Talk-Meta"))
 			if string(params) != `{"name":"profile.jpg","type":"image","ver":"2.0"}` ||
 				string(meta) != `{"profileContext":{"storyShare":false}}` ||
-				req.Header.Get("X-Line-ChannelToken") != "channel-token" || req.Header.Get("x-line-access") != "obs-token" ||
+				req.Header.Get("X-Line-ChannelToken") != "channel-token" || req.Header.Get("x-line-access") != "main-token" ||
+				req.Header.Get("X-Line-Mid") != "UAccount_fake-90" ||
 				req.Header.Get("Content-Type") != "image/jpeg" {
 				t.Fatalf("unexpected profile upload headers: %v params=%s meta=%s", req.Header, params, meta)
 			}
@@ -275,15 +287,20 @@ func TestUploadProfileImageUsesPersonalPathAndStrictResponse(t *testing.T) {
 			}
 			continue
 		}
-		if outcome, _ := ProfileWriteOutcomeOf(err); err == nil || outcome != tc.outcome {
+		outcome, code := ProfileWriteOutcomeOf(err)
+		if err == nil || outcome != tc.outcome {
 			t.Fatalf("%s: err=%v outcome=%s", tc.name, err, outcome)
+		}
+		wantCode := map[int]string{401: "PROFILE_OBS_UNAUTHORIZED", 403: "PROFILE_OBS_UNAUTHORIZED", 400: "PROFILE_OBS_REJECTED", 500: "PROFILE_OBS_HTTP_UNKNOWN"}[tc.status]
+		if wantCode != "" && (code != wantCode || ProfileWriteHTTPStatus(err) != tc.status) {
+			t.Fatalf("%s: code=%s status=%d", tc.name, code, ProfileWriteHTTPStatus(err))
 		}
 	}
 }
 
 func TestUploadProfileImageRefusesOtherTargetsBeforeNetwork(t *testing.T) {
-	installCachedOBSToken(t)
 	client := NewClient("main-token")
+	client.HTTPClient = noRPCClient(t)
 	installProfileChannelToken(client)
 	client.OBSClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		t.Fatal("must not reach OBS")
@@ -301,5 +318,34 @@ func TestUploadProfileImageRefusesOtherTargetsBeforeNetwork(t *testing.T) {
 		if outcome, _ := ProfileWriteOutcomeOf(err); outcome != ProfileWriteNotSent {
 			t.Fatalf("mid=%q outcome=%s", tc.mid, outcome)
 		}
+	}
+}
+
+func TestUploadProfileImageTokenUnavailableIsNotSent(t *testing.T) {
+	jpegData := encodeTestImage(t, "jpeg", 8, 8)
+	noOBS := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("must not reach OBS without both tokens")
+		return nil, nil
+	})}
+	// No main access token: nothing is sent anywhere.
+	client := NewClient("")
+	client.HTTPClient, client.OBSClient = noRPCClient(t), noOBS
+	installProfileChannelToken(client)
+	_, err := client.UploadProfileImageContext(context.Background(), "UAccount_fake-90", jpegData)
+	if outcome, code := ProfileWriteOutcomeOf(err); outcome != ProfileWriteNotSent || code != "PROFILE_ACCESS_TOKEN_UNAVAILABLE" {
+		t.Fatalf("outcome=%s code=%s", outcome, code)
+	}
+	// Channel token cannot be issued: not sent, OBS never contacted.
+	client = NewClient("main-token")
+	client.OBSClient = noOBS
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(req.URL.Path, "/ChannelService/issueChannelToken") {
+			t.Fatalf("unexpected RPC %s", req.URL.Path)
+		}
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"code":1,"message":"channel not approved"}`))}, nil
+	})}
+	_, err = client.UploadProfileImageContext(context.Background(), "UAccount_fake-90", jpegData)
+	if outcome, code := ProfileWriteOutcomeOf(err); outcome != ProfileWriteNotSent || code != "PROFILE_CHANNEL_TOKEN_UNAVAILABLE" {
+		t.Fatalf("outcome=%s code=%s", outcome, code)
 	}
 }
