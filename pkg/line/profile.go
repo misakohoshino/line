@@ -74,12 +74,13 @@ const (
 	ProfileWriteUnknown ProfileWriteOutcome = "unknown"
 )
 
-// ProfileWriteError is a classified failure. Code is a fixed identifier that
-// is safe to log; Err may contain LINE text and must not be logged verbatim.
+// ProfileWriteError is a classified failure. Code and HTTPStatus are safe to
+// log; Err may contain LINE text and must not be logged verbatim.
 type ProfileWriteError struct {
-	Outcome ProfileWriteOutcome
-	Code    string
-	Err     error
+	Outcome    ProfileWriteOutcome
+	Code       string
+	HTTPStatus int
+	Err        error
 }
 
 func (e *ProfileWriteError) Error() string {
@@ -93,6 +94,19 @@ func (e *ProfileWriteError) Unwrap() error { return e.Err }
 
 func profileWriteError(outcome ProfileWriteOutcome, code string, err error) *ProfileWriteError {
 	return &ProfileWriteError{Outcome: outcome, Code: code, Err: err}
+}
+
+func profileHTTPError(outcome ProfileWriteOutcome, code string, status int) *ProfileWriteError {
+	return &ProfileWriteError{Outcome: outcome, Code: code, HTTPStatus: status, Err: fmt.Errorf("HTTP %d", status)}
+}
+
+// ProfileWriteHTTPStatus returns the HTTP status LINE answered with, or 0.
+func ProfileWriteHTTPStatus(err error) int {
+	var classified *ProfileWriteError
+	if errors.As(err, &classified) {
+		return classified.HTTPStatus
+	}
+	return 0
 }
 
 // ProfileWriteOutcomeOf returns the classified outcome of err. An unclassified
@@ -174,10 +188,10 @@ func (c *Client) UpdateProfileAttributeContext(ctx context.Context, reqSeq int64
 	defer resp.Body.Close()
 	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, profileResponseLimit+1))
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		return profileWriteError(ProfileWriteRejected, "PROFILE_HTTP_REJECTED", fmt.Errorf("HTTP %d", resp.StatusCode))
+		return profileHTTPError(ProfileWriteRejected, "PROFILE_HTTP_REJECTED", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return profileWriteError(ProfileWriteUnknown, "PROFILE_HTTP_UNKNOWN", fmt.Errorf("HTTP %d", resp.StatusCode))
+		return profileHTTPError(ProfileWriteUnknown, "PROFILE_HTTP_UNKNOWN", resp.StatusCode)
 	}
 	if readErr != nil || len(raw) > profileResponseLimit {
 		return profileWriteError(ProfileWriteUnknown, "PROFILE_RESPONSE_UNREADABLE", readErr)
@@ -299,6 +313,13 @@ type ProfileImageUploadResult struct {
 // UploadProfileImageContext uploads one already normalized JPEG to the
 // account's own personal profile path talk/p/{selfMid}. One attempt only; the
 // caller must verify the result by reading the profile back.
+//
+// Authorization follows the CHROMEOS profile-image contract: the main access
+// token in X-Line-Access plus X-Line-Mid (self) and the channel token. CHRLINE
+// (object.py Hraders4Obs) uses the encrypted OBS token only for non-CHROMEOS
+// devices, and the existing album preview download (Chrome channel token +
+// main access token) follows the same pattern. The encrypted OBS token used
+// by chat media (talk/m) is not used here.
 func (c *Client) UploadProfileImageContext(ctx context.Context, selfMid string, jpegData []byte) (*ProfileImageUploadResult, error) {
 	if !profileSelfMIDPattern.MatchString(selfMid) {
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_SELF_MID_INVALID", nil)
@@ -306,9 +327,8 @@ func (c *Client) UploadProfileImageContext(ctx context.Context, selfMid string, 
 	if len(jpegData) == 0 || len(jpegData) > profileImageMaxOutput || !bytes.HasPrefix(jpegData, []byte{0xff, 0xd8, 0xff}) {
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_IMAGE_INVALID", nil)
 	}
-	obsToken, err := c.AcquireEncryptedAccessToken()
-	if err != nil {
-		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_OBS_TOKEN_UNAVAILABLE", err)
+	if c.AccessToken == "" {
+		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_ACCESS_TOKEN_UNAVAILABLE", nil)
 	}
 	channelToken, err := c.AcquireChannelAccessToken(ProfileImageChannelID)
 	if err != nil {
@@ -327,7 +347,8 @@ func (c *Client) UploadProfileImageContext(ctx context.Context, selfMid string, 
 	req.Header.Set("Content-Type", "image/jpeg")
 	req.Header.Set("X-Obs-Params", base64.StdEncoding.EncodeToString(params))
 	req.Header.Set("X-Talk-Meta", base64.StdEncoding.EncodeToString(talkMeta))
-	req.Header.Set("x-line-access", obsToken)
+	req.Header.Set("x-line-access", c.AccessToken)
+	req.Header.Set("X-Line-Mid", selfMid)
 	req.Header.Set("X-Line-ChannelToken", channelToken)
 
 	resp, err := c.obsHTTPClient().Do(req)
@@ -338,10 +359,14 @@ func (c *Client) UploadProfileImageContext(ctx context.Context, selfMid string, 
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	switch {
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		// OBS refused this upload's authorization. This is not, by itself, a
+		// signal that the LINE session is invalid (text profile writes work).
+		return nil, profileHTTPError(ProfileWriteRejected, "PROFILE_OBS_UNAUTHORIZED", resp.StatusCode)
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		return nil, profileWriteError(ProfileWriteRejected, "PROFILE_OBS_REJECTED", fmt.Errorf("HTTP %d", resp.StatusCode))
+		return nil, profileHTTPError(ProfileWriteRejected, "PROFILE_OBS_REJECTED", resp.StatusCode)
 	default:
-		return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_OBS_HTTP_UNKNOWN", fmt.Errorf("HTTP %d", resp.StatusCode))
+		return nil, profileHTTPError(ProfileWriteUnknown, "PROFILE_OBS_HTTP_UNKNOWN", resp.StatusCode)
 	}
 	oid := resp.Header.Get("x-obs-oid")
 	hash := resp.Header.Get("x-obs-hash")

@@ -440,3 +440,42 @@ func TestDIVAProfileResultNotFoundOnlyWithoutEntry(t *testing.T) {
 		t.Fatalf("expired request: %d %+v", status, result)
 	}
 }
+
+func TestDIVAProfileOBSUnauthorizedIsNotReportedAsLoginFailure(t *testing.T) {
+	meta := map[string]any{"version": 1, "request_id": newDIVARequestID(), "account_mid": divaProfileTestAccount,
+		"operation": divaProfileOperationPhoto, "mime_type": "image/png"}
+	obsDenied := &line.ProfileWriteError{Outcome: line.ProfileWriteRejected, Code: "PROFILE_OBS_UNAUTHORIZED",
+		HTTPStatus: 403, Err: errors.New("HTTP 403")}
+	api := &fakeProfileAPI{profiles: []*line.Profile{profileSelf("名", "", "p1")}, writeErr: obsDenied}
+	h := profileHarness(t, api, divaProfileOperationPhoto)
+	var logs bytes.Buffer
+	h.s.cfg.log = zerolog.New(&logs)
+	status, result := postProfilePhoto(t, h, meta, profilePNG(t), false)
+	reads, _, uploads := api.counts()
+	if status != 200 || result.State != divaProfileStateRejected || result.Code != "PROFILE_OBS_UNAUTHORIZED" ||
+		result.Readback != divaProfileReadbackNotAttempted || uploads != 1 || reads != 1 {
+		t.Fatalf("status=%d result=%+v uploads=%d reads=%d", status, result, uploads, reads)
+	}
+	if !strings.Contains(logs.String(), `"http_status":403`) || strings.Contains(logs.String(), "PROFILE_LINE_AUTH_REJECTED") {
+		t.Fatalf("log must keep the OBS status, not a login failure: %s", logs.String())
+	}
+	// The same request_id is never uploaded again.
+	if _, again := postProfilePhoto(t, h, meta, profilePNG(t), false); again.State != divaProfileStateRejected || !again.Deduplicated {
+		t.Fatalf("replay: %+v", again)
+	}
+	if _, _, uploads := api.counts(); uploads != 1 {
+		t.Fatalf("rejected photo uploaded again: %d", uploads)
+	}
+	// A real TalkException auth rejection of the text RPC still maps to the login code.
+	textAuth := &line.ProfileWriteError{Outcome: line.ProfileWriteRejected, Code: "PROFILE_LINE_REJECTED",
+		Err: errors.New(`updateProfileAttributes failed: code 10051 message RESPONSE_ERROR data {"name":"TalkException","code":119,"reason":"Access token refresh required"}`)}
+	if got := divaProfileWriteCode(textAuth, textAuth.Code); got != "PROFILE_LINE_AUTH_REJECTED" {
+		t.Fatalf("text auth mapping: %s", got)
+	}
+	for _, code := range []string{"PROFILE_OBS_UNAUTHORIZED", "PROFILE_OBS_REJECTED"} {
+		err := &line.ProfileWriteError{Outcome: line.ProfileWriteRejected, Code: code, HTTPStatus: 401, Err: errors.New("HTTP 401")}
+		if got := divaProfileWriteCode(err, code); got != code {
+			t.Fatalf("%s mapped to %s", code, got)
+		}
+	}
+}

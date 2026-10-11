@@ -151,6 +151,8 @@ type divaProfileResult struct {
 	Readback     string `json:"readback"`
 	Code         string `json:"code,omitempty"`
 	Deduplicated bool   `json:"deduplicated"`
+	// httpStatus is LINE's HTTP status for a failed write; log only.
+	httpStatus int
 }
 
 type divaProfileEntry struct {
@@ -552,7 +554,7 @@ func (s *divaControlServer) runProfile(job *divaProfileJob, entry *divaProfileEn
 		job.image = nil
 		s.cfg.log.Info().Str("request_id", job.requestID).Str("operation", job.operation).
 			Str("state", result.State).Str("write", result.Write).Str("readback", result.Readback).
-			Str("code", result.Code).Int("image_bytes", job.imageInfo.OutputBytes).
+			Str("code", result.Code).Int("http_status", result.httpStatus).Int("image_bytes", job.imageInfo.OutputBytes).
 			Msg("DIVA owner profile write finished")
 		s.mu.Lock()
 		entry.result = result
@@ -577,9 +579,16 @@ func (s *divaControlServer) readSelfProfile(ctx context.Context, lc *LineClient,
 	return profile, true
 }
 
+// divaProfileWriteCode maps a LINE RPC auth rejection of the text profile
+// write to PROFILE_LINE_AUTH_REJECTED. OBS photo upload statuses keep their own
+// codes: an OBS 401/403 rejects that upload's authorization and must not be
+// reported as "the LINE login needs refreshing".
 func divaProfileWriteCode(err error, code string) string {
-	if line.IsAuthError(err) {
-		return "PROFILE_LINE_AUTH_REJECTED"
+	switch code {
+	case "PROFILE_LINE_REJECTED", "PROFILE_HTTP_REJECTED":
+		if line.IsAuthError(err) {
+			return "PROFILE_LINE_AUTH_REJECTED"
+		}
 	}
 	return code
 }
@@ -639,6 +648,7 @@ func (s *divaControlServer) executeProfile(ctx context.Context, job *divaProfile
 	} else {
 		outcome, code := line.ProfileWriteOutcomeOf(writeErr)
 		result.Code = divaProfileWriteCode(writeErr, code)
+		result.httpStatus = line.ProfileWriteHTTPStatus(writeErr)
 		switch outcome {
 		case line.ProfileWriteNotSent:
 			result.State = divaProfileStateNotSent
