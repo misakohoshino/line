@@ -3,6 +3,7 @@ package line
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,152 +11,134 @@ import (
 	"testing"
 )
 
-func profileApprovalClient(t *testing.T) *http.Client {
-	t.Helper()
-	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := io.ReadAll(req.Body)
-		if req.URL.Host != "line-chrome-gw.line-apps.com" || !strings.HasSuffix(req.URL.Path, "/ChannelService/approveChannelAndIssueChannelToken") || string(body) != `["1341209850"]` || req.Header.Get("x-hmac") == "" || req.Header.Get("x-line-access") != "main-token" {
-			t.Fatalf("unexpected approval request path/body/headers")
+func TestChromeProfileCoverUploadAssociateThenFreshRead(t *testing.T) {
+	client := NewClient("main-token")
+	calls := []string{}
+	var oid string
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.URL.Path)
+		if req.URL.Host != "line-chrome-gw.line-apps.com" ||
+			req.Header.Get("X-Line-Access") != "main-token" ||
+			req.Header.Get("X-Line-Chrome-Version") != ExtensionVersion {
+			t.Fatal("wrong gateway credentials")
 		}
-		return obsResponse(200, `{"code":0,"data":{"channelAccessToken":"channel-token"}}`), nil
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/TalkService/getProfile"):
+			return obsResponse(200, `{"code":0,"data":{"mid":"USelf","regionCode":"JP"}}`), nil
+		case strings.HasSuffix(req.URL.Path, "/ChannelService/issueChannelToken"):
+			if req.Header.Get("X-Hmac") == "" { t.Fatal("channel token request unsigned") }
+			return obsResponse(200, `{"code":0,"data":{"channelAccessToken":"channel-token"}}`), nil
+		case req.URL.Path == "/api/timeline/updateCover":
+			if req.Method != http.MethodPost ||
+				req.Header.Get("X-Hmac") == "" ||
+				req.Header.Get("X-Line-ChannelToken") != "channel-token" {
+				t.Fatal("cover association not signed/scoped")
+			}
+			body, _ := io.ReadAll(req.Body)
+			var m map[string]any
+			_ = json.Unmarshal(body, &m)
+			if m["myMid"] != "USelf" || m["myRegion"] != "JP" ||
+				m["coverObjectId"] != oid || m["storyShare"] != false {
+				t.Fatal("cover association does not match upload")
+			}
+			return obsResponse(200, `{"message":"OK","data":{}}`), nil
+		case req.URL.Path == "/api/timeline/getCover":
+			if req.Method != http.MethodGet || req.URL.Query().Get("targetMid") != "USelf" ||
+				req.URL.Query().Get("myMid") != "USelf" || req.URL.Query().Get("myRegion") != "JP" ||
+				req.Header.Get("X-Hmac") == "" || req.Header.Get("X-Line-ChannelToken") != "channel-token" {
+				t.Fatal("cover read was not fresh self-scoped")
+			}
+			return obsResponse(200, `{"message":"OK","data":{"homeId":"USelf","coverObsInfo":{"objectId":"`+oid+`","serviceName":"myhome","obsNamespace":"c"}}}`), nil
+		default:
+			t.Fatalf("unexpected Chrome gateway request %s", req.URL.Path)
+			return nil, nil
+		}
 	})}
-}
-
-func TestProfileCoverUploadAssociationAndFreshRead(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		status  int
-		body    string
-		outcome ProfileWriteOutcome
-	}{
-		{"association accepted", 200, `{"code":0}`, ""},
-		{"association rejected", 403, `{}`, ProfileWriteRejected},
-		{"association unauthorized", 401, `{}`, ProfileWriteRejected},
-		{"association server error", 500, `{}`, ProfileWriteUnknown},
-		{"association missing code", 200, `{}`, ProfileWriteUnknown},
-		{"association app rejected", 200, `{"code":1}`, ProfileWriteRejected},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			client := NewClient("main-token")
-			client.HTTPClient = profileApprovalClient(t)
-			writes, reads := 0, 0
-			var objectID string
-			client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.Header.Get("X-Line-Access") != "main-token" || req.Header.Get("X-Line-ChannelToken") != "channel-token" || req.Header.Get("X-Line-Mid") != "USelf" {
-					t.Fatal("mixed authorization")
-				}
-				switch req.URL.Host {
-				case "gwz.line.naver.jp":
-					if !strings.HasPrefix(req.URL.Path, "/oa/r/myhome/c/") || req.Method != "POST" || req.Header.Get("X-Talk-Meta") != "" {
-						t.Fatal("wrong cover upload path")
-					}
-					objectID = strings.TrimPrefix(req.URL.Path, "/oa/r/myhome/c/")
-					writes++
-					resp := obsResponse(201, "")
-					resp.Header.Set("x-obs-oid", objectID)
-					resp.Header.Set("x-obs-hash", "hash")
-					return resp, nil
-				case "ga2.line.naver.jp":
-					if req.URL.Path != "/hm/api/v1/home/cover.json" || req.Method != "POST" || req.Header.Get("X-LAP") != "5" || req.Header.Get("X-LPV") != "1" {
-						t.Fatal("wrong association host or headers")
-					}
-					if req.Header.Get("X-LHM") == "GET" {
-						reads++
-						if req.URL.Query().Get("homeId") != "USelf" || req.Header.Get("Cache-Control") == "" {
-							t.Fatal("not a fresh self read")
-						}
-						return obsResponse(200, `{"code":0,"result":{"homeId":"USelf","coverObsInfo":{"serviceName":"myhome","obsNamespace":"c","objectId":"`+objectID+`"}}}`), nil
-					}
-					raw, _ := io.ReadAll(req.Body)
-					var data map[string]any
-					_ = json.Unmarshal(raw, &data)
-					if data["homeId"] != "USelf" || data["coverObjectId"] != objectID || data["storyShare"] != false {
-						t.Fatal("association differs from uploaded object")
-					}
-					writes++
-					return obsResponse(tc.status, tc.body), nil
-				default:
-					t.Fatalf("unexpected host %s", req.URL.Host)
-					return nil, nil
-				}
-			})}
-			jpeg := encodeTestImage(t, "jpeg", 8, 8)
-			result, err := client.UploadProfileCoverContext(context.Background(), "USelf", jpeg)
-			if writes != 2 || reads != 0 {
-				t.Fatal("unexpected side effects or upload-only success")
-			}
-			if tc.outcome != "" {
-				outcome, _ := ProfileWriteOutcomeOf(err)
-				if outcome != tc.outcome {
-					t.Fatalf("outcome=%s err=%v", outcome, err)
-				}
-				return
-			}
-			if err != nil || result.ObjectID != objectID {
-				t.Fatalf("upload result: %v", err)
-			}
-			oid, err := client.ReadProfileCoverContext(context.Background(), "USelf")
-			if err != nil || oid != objectID || reads != 1 {
-				t.Fatal("fresh exact self read failed")
-			}
-		})
+	client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.URL.Path)
+		if req.URL.Host != "obs.line-apps.com" ||
+			!strings.HasPrefix(req.URL.Path, "/r/myhome/c/") ||
+			req.Header.Get("X-Line-ChannelToken") != "channel-token" ||
+			req.Header.Get("X-Line-Access") != "" || req.Header.Get("Content-Type") != "" {
+			t.Fatal("myhome must use Chrome OBS channel credentials")
+		}
+		oid = strings.TrimPrefix(req.URL.Path, "/r/myhome/c/")
+		p, err := base64.StdEncoding.DecodeString(req.Header.Get("X-Obs-Params"))
+		if err != nil || !bytes.Contains(p, []byte(`"ver":"2.0"`)) { t.Fatal("missing Chrome OBS params") }
+		body, _ := io.ReadAll(req.Body)
+		if !bytes.Equal(body, encodeTestImage(t, "jpeg", 8, 8)) { t.Fatal("cover upload bytes changed") }
+		return obsResponse(200, `{"ok":true}`), nil
+	})}
+	jpeg := encodeTestImage(t, "jpeg", 8, 8)
+	uploaded, err := client.UploadProfileCoverContext(context.Background(), "USelf", jpeg)
+	if err != nil || uploaded == nil || uploaded.ObjectID == "" || uploaded.ObjectID != oid {
+		t.Fatalf("upload+association failed: %v", err)
 	}
+	confirmed, err := client.ReadProfileCoverContext(context.Background(), "USelf")
+	if err != nil || confirmed != oid { t.Fatalf("fresh self cover read did not match: %v", err) }
+	if len(calls) != 7 { t.Fatalf("unexpected extra calls %v", calls) }
 }
 
-func TestProfileCoverRejectsUnprovenSelfSchema(t *testing.T) {
+func TestChromeCoverRejectsWrongSelfAndUnprovenReadback(t *testing.T) {
 	for _, raw := range []string{
-		`{}`, `{"code":0,"result":{"coverObsInfo":{"serviceName":"myhome","obsNamespace":"c","objectId":"oid"}}}`,
-		`{"code":0,"result":{"homeId":"UOther","coverObsInfo":{"serviceName":"myhome","obsNamespace":"c","objectId":"oid"}}}`,
-		`{"code":0,"result":{"homeId":"USelf","coverObsInfo":{"serviceName":"talk","obsNamespace":"p","objectId":"oid"}}}`,
+		`{}`,
+		`{"coverObsInfo":{"objectId":"oid"},"homeId":"other"}`,
+		`{"coverObsInfo":{"objectId":"../secret"},"homeId":"USelf"}`,
+		`{"coverObsInfo":{"objectId":"oid","serviceName":"talk"}}`,
+		`{"coverObsInfo":{}}`,
 	} {
 		if _, err := parseProfileCover([]byte(raw), "USelf"); err == nil {
-			t.Fatal("unproven self accepted")
+			t.Fatalf("accepted unverified cover schema: %s", raw)
 		}
 	}
-}
-
-func TestProfileCandidateRedirectDoesNotLeakOrRetry(t *testing.T) {
+	if id, err := parseProfileCover([]byte(`{"coverObsInfo":{"objectId":"safe_oid"}}`), "USelf"); err != nil || id != "safe_oid" {
+		t.Fatal("Chrome self-scoped response with object ID should be readable")
+	}
 	client := NewClient("main-token")
-	client.HTTPClient = profileApprovalClient(t)
-	calls := 0
-	client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		if calls > 1 {
-			t.Fatal("redirect followed")
-		}
-		r := obsResponse(307, "")
-		r.Header.Set("Location", "https://example.invalid/steal")
-		return r, nil
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(req.URL.Path, "/TalkService/getProfile") { t.Fatal("must stop before upload") }
+		return obsResponse(200, `{"code":0,"data":{"mid":"UOther","regionCode":"JP"}}`), nil
 	})}
-	_, err := client.UploadProfileImageContext(context.Background(), "USelf", encodeTestImage(t, "jpeg", 8, 8))
-	if outcome, _ := ProfileWriteOutcomeOf(err); outcome != ProfileWriteUnknown || calls != 1 {
-		t.Fatal("redirect must be unknown and never retried")
+	client.OBSClient = noRPCClient(t)
+	_, err := client.UploadProfileCoverContext(context.Background(), "USelf", encodeTestImage(t, "jpeg", 8, 8))
+	if outcome, _ := ProfileWriteOutcomeOf(err); outcome != ProfileWriteNotSent {
+		t.Fatalf("wrong self must not upload, outcome=%s", outcome)
 	}
 }
 
-func TestProfileCandidateUploadFailureNeverAssociates(t *testing.T) {
-	for _, status := range []int{401, 403, 500} {
+func TestChromeCoverUploadFailureStopsBeforeAssociation(t *testing.T) {
+	for _, status := range []int{401, 403, 500, 307} {
 		client := NewClient("main-token")
-		client.HTTPClient = profileApprovalClient(t)
-		calls := 0
-		client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			calls++
-			if req.URL.Host != "gwz.line.naver.jp" {
-				t.Fatal("associated after failed upload")
+		client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case strings.HasSuffix(req.URL.Path, "/TalkService/getProfile"):
+				return obsResponse(200, `{"code":0,"data":{"mid":"USelf","regionCode":"JP"}}`), nil
+			case strings.HasSuffix(req.URL.Path, "/ChannelService/issueChannelToken"):
+				return obsResponse(200, `{"code":0,"data":{"channelAccessToken":"channel-token"}}`), nil
+			default:
+				t.Fatal("failed OBS upload must never associate cover")
+				return nil, nil
 			}
-			return obsResponse(status, ""), nil
+		})}
+		count := 0
+		client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			count++
+			r := obsResponse(status, "")
+			if status == 307 { r.Header.Set("Location", "https://invalid.example") }
+			return r, nil
 		})}
 		_, err := client.UploadProfileCoverContext(context.Background(), "USelf", encodeTestImage(t, "jpeg", 8, 8))
-		if err == nil || calls != 1 {
-			t.Fatal("failed upload continued")
-		}
+		outcome, _ := ProfileWriteOutcomeOf(err)
+		if count != 1 || err == nil { t.Fatalf("must stop after one upload: %v", err) }
+		if status == 401 || status == 403 {
+			if outcome != ProfileWriteRejected { t.Fatal("auth rejection not classified") }
+		} else if outcome != ProfileWriteUnknown { t.Fatal("uncertain upload not classified unknown") }
 	}
 }
 
-func TestProfileCoverInvalidImageHasNoApprovalOrUpload(t *testing.T) {
+func TestChromeCoverInvalidImageNeverSendsNetwork(t *testing.T) {
 	client := NewClient("main-token")
-	client.HTTPClient = noRPCClient(t)
-	client.OBSClient = noRPCClient(t)
+	client.HTTPClient, client.OBSClient = noRPCClient(t), noRPCClient(t)
 	_, err := client.UploadProfileCoverContext(context.Background(), "USelf", bytes.Repeat([]byte("x"), 10))
 	if outcome, _ := ProfileWriteOutcomeOf(err); outcome != ProfileWriteNotSent {
 		t.Fatal("invalid image sent")
