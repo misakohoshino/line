@@ -36,7 +36,9 @@ func TestProfileCoverInspectOnlyReadsSelfAndSanitizesResult(t *testing.T) {
 	if err != nil || !info.HasCoverInfo || !info.HasOID || !info.HasSID || !info.HasHomeID || !info.ParsedSelfCover {
 		t.Fatalf("cover schema not safely recognized: %+v, %v", info, err)
 	}
-	if len(calls) != 3 { t.Fatalf("expected exactly 3 read/auth calls, got %v", calls) }
+	if len(calls) != 3 {
+		t.Fatalf("expected exactly 3 read/auth calls, got %v", calls)
+	}
 	for _, entry := range calls {
 		if strings.Contains(entry, "updateCover") || strings.Contains(entry, "upload") {
 			t.Fatalf("inspection unexpectedly writes profile: %s", entry)
@@ -49,10 +51,14 @@ func TestProfileCoverInspectWrongSelfNeverRequestsChannelOrCover(t *testing.T) {
 	count := 0
 	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		count++
-		if !strings.HasSuffix(req.URL.Path, "/TalkService/getProfile") { t.Fatal("wrong self continued into cover") }
+		if !strings.HasSuffix(req.URL.Path, "/TalkService/getProfile") {
+			t.Fatal("wrong self continued into cover")
+		}
 		return obsResponse(200, `{"code":0,"data":{"mid":"UOther","regionCode":"JP"}}`), nil
 	})}
 	client.OBSClient = noRPCClient(t)
 	_, err := client.InspectProfileCoverContext(context.Background(), "USelf")
-	if err == nil || count != 1 { t.Fatalf("cross-account probe was not refused: requests=%d, err=%v", count, err) }
+	if err == nil || count != 1 {
+		t.Fatalf("cross-account probe was not refused: requests=%d, err=%v", count, err)
+	}
 }
