@@ -27,6 +27,7 @@ const (
 	// switch alone may bypass the connector's separate cover protocol gate.
 	ProfileImageProtocolBlocked = "PROFILE_CHROME_IMAGE_PROTOCOL_UNVERIFIED"
 )
+
 var profileRegionPattern = regexp.MustCompile(`^[A-Z]{2}$`)
 
 func profileCandidateClient(client *http.Client) *http.Client {
@@ -137,9 +138,11 @@ func (c *Client) acquireProfileChannelTokenContext(ctx context.Context) (string,
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, profileResponseLimit+1))
 	var wrapper struct {
-		Code *int `json:"code"`
+		Code    *int   `json:"code"`
 		Message string `json:"message"`
-		Data struct { Token string `json:"channelAccessToken"` } `json:"data"`
+		Data    struct {
+			Token string `json:"channelAccessToken"`
+		} `json:"data"`
 	}
 	if resp.StatusCode != http.StatusOK || err != nil || len(raw) > profileResponseLimit ||
 		json.Unmarshal(raw, &wrapper) != nil || wrapper.Data.Token == "" ||
@@ -166,8 +169,8 @@ func (c *Client) profileCoverSelfRegion(ctx context.Context, mid string) (string
 func (c *Client) profileCoverRequest(ctx context.Context, mid, region, channel, objectID string) (json.RawMessage, error) {
 	var (
 		method = http.MethodGet
-		path string
-		body []byte
+		path   string
+		body   []byte
 	)
 	if objectID == "" {
 		path = "/api/timeline/getCover?" + url.Values{
@@ -198,10 +201,10 @@ func (c *Client) profileCoverRequest(ctx context.Context, mid, region, channel, 
 func parseProfileCover(raw []byte, mid string) (string, error) {
 	var obj struct {
 		HomeID string `json:"homeId"`
-		Cover struct {
-			Service string `json:"serviceName"`
+		Cover  struct {
+			Service   string `json:"serviceName"`
 			Namespace string `json:"obsNamespace"`
-			ObjectID string `json:"objectId"`
+			ObjectID  string `json:"objectId"`
 		} `json:"coverObsInfo"`
 	}
 	if json.Unmarshal(raw, &obj) != nil {
@@ -220,11 +223,17 @@ func parseProfileCover(raw []byte, mid string) (string, error) {
 
 func (c *Client) ReadProfileCoverContext(ctx context.Context, mid string) (string, error) {
 	region, err := c.profileCoverSelfRegion(ctx, mid)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	channel, err := c.acquireProfileChannelTokenContext(ctx)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	raw, err := c.profileCoverRequest(ctx, mid, region, channel, "")
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	return parseProfileCover(raw, mid)
 }
 
@@ -233,17 +242,23 @@ func (c *Client) UploadProfileCoverContext(ctx context.Context, mid string, jpeg
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_IMAGE_INVALID", nil)
 	}
 	region, err := c.profileCoverSelfRegion(ctx, mid)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	channel, err := c.acquireProfileChannelTokenContext(ctx)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	var random [16]byte
 	if _, err = rand.Read(random[:]); err != nil {
 		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_COVER_OBJECT_ID_UNAVAILABLE", nil)
 	}
 	objectID := hex.EncodeToString(random[:])
-	params, _ := json.Marshal(map[string]string{"name": objectID+".jpg", "type": "image", "ver": "2.0"})
+	params, _ := json.Marshal(map[string]string{"name": objectID + ".jpg", "type": "image", "ver": "2.0"})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, OBSBaseURL+"/r/myhome/c/"+objectID, bytes.NewReader(jpeg))
-	if err != nil { return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_COVER_UPLOAD_REQUEST_INVALID", nil) }
+	if err != nil {
+		return nil, profileWriteError(ProfileWriteNotSent, "PROFILE_COVER_UPLOAD_REQUEST_INVALID", nil)
+	}
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("X-Line-Chrome-Version", ExtensionVersion)
 	req.Header.Set("Accept-Language", "en-US")
@@ -251,10 +266,14 @@ func (c *Client) UploadProfileCoverContext(ctx context.Context, mid string, jpeg
 	req.Header.Set("X-Obs-Params", base64.StdEncoding.EncodeToString(params))
 	// Chrome's raw myhome OBS upload has no main access token or Content-Type.
 	resp, err := profileCandidateClient(c.obsHTTPClient()).Do(req)
-	if err != nil { return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_COVER_UPLOAD_TRANSPORT_UNKNOWN", nil) }
+	if err != nil {
+		return nil, profileWriteError(ProfileWriteUnknown, "PROFILE_COVER_UPLOAD_TRANSPORT_UNKNOWN", nil)
+	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, profileResponseLimit))
-	if err := classifyProfileHTTP(resp, "PROFILE_COVER_UPLOAD"); err != nil { return nil, err }
+	if err := classifyProfileHTTP(resp, "PROFILE_COVER_UPLOAD"); err != nil {
+		return nil, err
+	}
 	// A 2xx upload is not evidence of a changed cover. The ID was generated
 	// locally and will only be confirmed after timeline association + readback.
 	if _, err := c.profileCoverRequest(ctx, mid, region, channel, objectID); err != nil {
