@@ -303,6 +303,59 @@ func (s *divaControlServer) handleOwnerProfileCapabilities(w http.ResponseWriter
 	})
 }
 
+// CoverInspector does not expose object IDs and cannot write a profile image.
+type divaCoverInspector interface {
+	inspectCover(context.Context, *LineClient, string) (line.ProfileCoverInspection, error)
+}
+
+func (lineProfileAPI) inspectCover(ctx context.Context, lc *LineClient, selfMID string) (line.ProfileCoverInspection, error) {
+	return lc.newClient().InspectProfileCoverContext(ctx, selfMID)
+}
+
+// handleOwnerProfileCoverInspect is a strictly authenticated, self-only,
+// read-only probe. It is independent of profile_cover write enablement.
+// Never returns raw LINE JSON, MID, token, cover ID, or images.
+func (s *divaControlServer) handleOwnerProfileCoverInspect(w http.ResponseWriter, r *http.Request) {
+	_, account, ok := s.profileAccountQuery(w, r)
+	if !ok {
+		return
+	}
+	lc, selectErr := s.profileLogin(account)
+	if selectErr != nil {
+		writeDIVAError(w, selectErr.status, "", selectErr.code, selectErr.detail)
+		return
+	}
+	inspector, supported := s.cfg.profileAPI.(divaCoverInspector)
+	if !supported {
+		writeDIVAError(w, http.StatusServiceUnavailable, "", "PROFILE_COVER_INSPECT_UNSUPPORTED", "cover inspection unavailable")
+		return
+	}
+	select {
+	case s.ownerQuerySem <- struct{}{}:
+		defer func() { <-s.ownerQuerySem }()
+	default:
+		writeDIVAError(w, http.StatusServiceUnavailable, "", outboundInternal, "owner query busy")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), divaProfileReadTimeout)
+	defer cancel()
+	info, err := inspector.inspectCover(ctx, lc, account)
+	code := ""
+	if err != nil {
+		_, code = line.ProfileWriteOutcomeOf(err)
+		if code == "" {
+			code = "PROFILE_COVER_INSPECT_UNAVAILABLE"
+		}
+	}
+	writeDIVAJSON(w, http.StatusOK, map[string]any{
+		"version":   divaProfileContractVersion,
+		"ok":        err == nil,
+		"read_only": true,
+		"schema":    info,
+		"code":      code,
+	})
+}
+
 // handleOwnerProfileSelf is the read-only check used to settle an unknown
 // result after a restart. It returns hashes, never the profile values.
 func (s *divaControlServer) handleOwnerProfileSelf(w http.ResponseWriter, r *http.Request) {

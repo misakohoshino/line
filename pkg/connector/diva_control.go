@@ -787,6 +787,7 @@ func (s *divaControlServer) handler() http.Handler {
 	mux.HandleFunc("/diva/v1/owner/joined-groups", s.handleOwnerJoinedGroups)
 	mux.HandleFunc("/diva/v1/owner/profile/capabilities", s.handleOwnerProfileCapabilities)
 	mux.HandleFunc("/diva/v1/owner/profile/self", s.handleOwnerProfileSelf)
+	mux.HandleFunc("/diva/v1/owner/profile/cover/inspect", s.handleOwnerProfileCoverInspect)
 	mux.HandleFunc("/diva/v1/owner/profile/update", s.handleOwnerProfileUpdate)
 	mux.HandleFunc("/diva/v1/owner/profile/photo", s.handleOwnerProfilePhoto)
 	mux.HandleFunc("/diva/v1/owner/profile/cover", s.handleOwnerProfileCover)
