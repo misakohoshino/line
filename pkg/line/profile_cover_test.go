@@ -26,7 +26,9 @@ func TestChromeProfileCoverUploadAssociateThenFreshRead(t *testing.T) {
 		case strings.HasSuffix(req.URL.Path, "/TalkService/getProfile"):
 			return obsResponse(200, `{"code":0,"data":{"mid":"USelf","regionCode":"JP"}}`), nil
 		case strings.HasSuffix(req.URL.Path, "/ChannelService/issueChannelToken"):
-			if req.Header.Get("X-Hmac") == "" { t.Fatal("channel token request unsigned") }
+			if req.Header.Get("X-Hmac") == "" {
+				t.Fatal("channel token request unsigned")
+			}
 			return obsResponse(200, `{"code":0,"data":{"channelAccessToken":"channel-token"}}`), nil
 		case req.URL.Path == "/api/timeline/updateCover":
 			if req.Method != http.MethodPost ||
@@ -64,9 +66,13 @@ func TestChromeProfileCoverUploadAssociateThenFreshRead(t *testing.T) {
 		}
 		oid = strings.TrimPrefix(req.URL.Path, "/r/myhome/c/")
 		p, err := base64.StdEncoding.DecodeString(req.Header.Get("X-Obs-Params"))
-		if err != nil || !bytes.Contains(p, []byte(`"ver":"2.0"`)) { t.Fatal("missing Chrome OBS params") }
+		if err != nil || !bytes.Contains(p, []byte(`"ver":"2.0"`)) {
+			t.Fatal("missing Chrome OBS params")
+		}
 		body, _ := io.ReadAll(req.Body)
-		if !bytes.Equal(body, encodeTestImage(t, "jpeg", 8, 8)) { t.Fatal("cover upload bytes changed") }
+		if !bytes.Equal(body, encodeTestImage(t, "jpeg", 8, 8)) {
+			t.Fatal("cover upload bytes changed")
+		}
 		return obsResponse(200, `{"ok":true}`), nil
 	})}
 	jpeg := encodeTestImage(t, "jpeg", 8, 8)
@@ -75,8 +81,12 @@ func TestChromeProfileCoverUploadAssociateThenFreshRead(t *testing.T) {
 		t.Fatalf("upload+association failed: %v", err)
 	}
 	confirmed, err := client.ReadProfileCoverContext(context.Background(), "USelf")
-	if err != nil || confirmed != oid { t.Fatalf("fresh self cover read did not match: %v", err) }
-	if len(calls) != 7 { t.Fatalf("unexpected extra calls %v", calls) }
+	if err != nil || confirmed != oid {
+		t.Fatalf("fresh self cover read did not match: %v", err)
+	}
+	if len(calls) != 7 {
+		t.Fatalf("unexpected extra calls %v", calls)
+	}
 }
 
 func TestChromeCoverRejectsWrongSelfAndUnprovenReadback(t *testing.T) {
@@ -96,7 +106,9 @@ func TestChromeCoverRejectsWrongSelfAndUnprovenReadback(t *testing.T) {
 	}
 	client := NewClient("main-token")
 	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if !strings.HasSuffix(req.URL.Path, "/TalkService/getProfile") { t.Fatal("must stop before upload") }
+		if !strings.HasSuffix(req.URL.Path, "/TalkService/getProfile") {
+			t.Fatal("must stop before upload")
+		}
 		return obsResponse(200, `{"code":0,"data":{"mid":"UOther","regionCode":"JP"}}`), nil
 	})}
 	client.OBSClient = noRPCClient(t)
@@ -124,15 +136,23 @@ func TestChromeCoverUploadFailureStopsBeforeAssociation(t *testing.T) {
 		client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			count++
 			r := obsResponse(status, "")
-			if status == 307 { r.Header.Set("Location", "https://invalid.example") }
+			if status == 307 {
+				r.Header.Set("Location", "https://invalid.example")
+			}
 			return r, nil
 		})}
 		_, err := client.UploadProfileCoverContext(context.Background(), "USelf", encodeTestImage(t, "jpeg", 8, 8))
 		outcome, _ := ProfileWriteOutcomeOf(err)
-		if count != 1 || err == nil { t.Fatalf("must stop after one upload: %v", err) }
+		if count != 1 || err == nil {
+			t.Fatalf("must stop after one upload: %v", err)
+		}
 		if status == 401 || status == 403 {
-			if outcome != ProfileWriteRejected { t.Fatal("auth rejection not classified") }
-		} else if outcome != ProfileWriteUnknown { t.Fatal("uncertain upload not classified unknown") }
+			if outcome != ProfileWriteRejected {
+				t.Fatal("auth rejection not classified")
+			}
+		} else if outcome != ProfileWriteUnknown {
+			t.Fatal("uncertain upload not classified unknown")
+		}
 	}
 }
 
