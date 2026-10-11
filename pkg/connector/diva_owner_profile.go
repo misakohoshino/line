@@ -105,11 +105,13 @@ type divaProfileAPI interface {
 // deliberately bypasses token recovery/re-login: an auth failure is reported.
 type lineProfileAPI struct{}
 
-// The legacy reference has not established Chrome channel approval, Origin
-// or the self cover response schema for this login. Keep candidate writes
-// inaccessible, even if an operator accidentally adds an image to the list.
+// Avatar now uses the native Chrome /api/obs/uploadProfile route documented
+// from the 3.7.2 extension. The new cover association/readback response shape
+// is not yet independently verified for this account: leave cover blocked even
+// if accidentally added to the production allow-list. Neither operation is
+// active unless the Worker and Bridge allow-lists both explicitly enable it.
 func (lineProfileAPI) protocolBlock(operation string) string {
-	if operation == divaProfileOperationPhoto || operation == divaProfileOperationCover {
+	if operation == divaProfileOperationCover {
 		return line.ProfileImageProtocolBlocked
 	}
 	return ""
@@ -296,7 +298,7 @@ func (s *divaControlServer) handleOwnerProfileCapabilities(w http.ResponseWriter
 		"account_connected":       selectionError == nil,
 		"enabled_operations":      s.enabledProfileOperations(),
 		"blocked_operations":      blocked,
-		"image_protocol":          "chrline-chrome-legy-candidate",
+		"image_protocol":          "chrome-native-gateway-candidate",
 		"image_protocol_verified": false,
 	})
 }

@@ -109,8 +109,10 @@ func TestDIVAProfileProductionCandidateBlockedEvenIfConfigured(t *testing.T) {
 		Blocked map[string]string `json:"blocked_operations"`
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &data)
-	if len(data.Enabled) != 1 || data.Enabled[0] != divaProfileOperationName || len(data.Blocked) != 2 {
-		t.Fatalf("candidate advertised ready: %s", w.Body.String())
+	if len(data.Enabled) != 2 || data.Enabled[0] != divaProfileOperationName ||
+		data.Enabled[1] != divaProfileOperationPhoto || len(data.Blocked) != 1 ||
+		data.Blocked[divaProfileOperationCover] != line.ProfileImageProtocolBlocked {
+		t.Fatalf("Chrome avatar candidate / blocked cover capabilities incorrect: %s", w.Body.String())
 	}
 }
 

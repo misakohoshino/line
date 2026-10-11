@@ -3,7 +3,6 @@ package line
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -225,92 +224,90 @@ func noRPCClient(t *testing.T) *http.Client {
 	})}
 }
 
-func TestUploadProfileImageUsesPersonalPathAndStrictResponse(t *testing.T) {
+func TestUploadProfileImageChromeGatewayRequestAndOutcomes(t *testing.T) {
 	jpegData := encodeTestImage(t, "jpeg", 8, 8)
 	for _, tc := range []struct {
-		name    string
-		status  int
-		headers map[string]string
-		err     error
-		outcome ProfileWriteOutcome
-		ok      bool
+		name     string
+		status   int
+		response string
+		network  error
+		outcome  ProfileWriteOutcome
 	}{
-		{"created", 201, map[string]string{"x-obs-oid": "oid_1", "x-obs-hash": "hash-1"}, nil, "", true},
-		{"cached", 200, map[string]string{"x-obs-oid": "oid_1", "x-obs-hash": "hash-1"}, nil, "", true},
-		{"200 without identifiers", 200, nil, nil, ProfileWriteUnknown, false},
-		{"200 without hash", 200, map[string]string{"x-obs-oid": "oid_1"}, nil, ProfileWriteUnknown, false},
-		{"bad identifier", 201, map[string]string{"x-obs-oid": "../x", "x-obs-hash": "h"}, nil, ProfileWriteUnknown, false},
-		{"forbidden", 403, nil, nil, ProfileWriteRejected, false},
-		{"unauthorized", 401, nil, nil, ProfileWriteRejected, false},
-		{"bad request", 400, nil, nil, ProfileWriteRejected, false},
-		{"server error", 500, nil, nil, ProfileWriteUnknown, false},
-		{"timeout", 0, nil, context.DeadlineExceeded, ProfileWriteUnknown, false},
+		{"chrome ok", 200, `{"message":"OK","data":{}}`, nil, ""},
+		{"legacy code ok", 201, `{"code":0,"data":{}}`, nil, ""},
+		{"no success envelope", 200, `{}`, nil, ProfileWriteUnknown},
+		{"empty body", 200, "", nil, ProfileWriteUnknown},
+		{"line rejection", 200, `{"message":"ERROR","code":19}`, nil, ProfileWriteRejected},
+		{"unauthorized", 401, `{}`, nil, ProfileWriteRejected},
+		{"forbidden", 403, `{}`, nil, ProfileWriteRejected},
+		{"invalid request", 400, `{}`, nil, ProfileWriteRejected},
+		{"server error", 503, `{}`, nil, ProfileWriteUnknown},
+		{"redirect", 307, "", nil, ProfileWriteUnknown},
+		{"transport unknown", 0, "", context.DeadlineExceeded, ProfileWriteUnknown},
 	} {
-		requests := 0
-		client := NewClient("main-token")
-		client.HTTPClient = profileApprovalClient(t)
-		client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			requests++
-			if req.Method != http.MethodPost || req.URL.Host != "gwz.line.naver.jp" || req.URL.Path != "/oa/r/talk/p/UAccount_fake-90" {
-				t.Fatalf("unexpected upload target %s %s", req.Method, req.URL)
+		t.Run(tc.name, func(t *testing.T) {
+			count := 0
+			client := NewClient("main-token")
+			client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				count++
+				if count != 1 || req.Method != http.MethodPost ||
+					req.URL.Host != "line-chrome-gw.line-apps.com" ||
+					req.URL.Path != "/api/obs/uploadProfile" ||
+					req.URL.Query().Get("mid") != "UAccount_fake-90" ||
+					req.Header.Get("X-Line-Access") != "main-token" ||
+					req.Header.Get("X-Line-Chrome-Version") != ExtensionVersion ||
+					req.Header.Get("Content-Type") != "image/jpeg" ||
+					req.Header.Get("X-Line-ChannelToken") != "" ||
+					req.Header.Get("X-Line-Mid") != "" ||
+					req.Header.Get("X-Line-Application") != "" ||
+					req.Header.Get("X-Obs-Params") != "" {
+					t.Fatal("unexpected Chrome profile upload request")
+				}
+				body, _ := io.ReadAll(req.Body)
+				if !bytes.Equal(body, jpegData) {
+					t.Fatal("upload body changed")
+				}
+				if tc.network != nil {
+					return nil, tc.network
+				}
+				r := obsResponse(tc.status, tc.response)
+				if tc.status == 307 {
+					r.Header.Set("Location", "https://invalid.example/steal")
+				}
+				return r, nil
+			})}
+			client.OBSClient = noRPCClient(t)
+			result, err := client.UploadProfileImageContext(context.Background(), "UAccount_fake-90", jpegData)
+			if count != 1 {
+				t.Fatalf("requests=%d: must not retry", count)
 			}
-			params, _ := base64.StdEncoding.DecodeString(req.Header.Get("X-Obs-Params"))
-			meta, _ := base64.StdEncoding.DecodeString(req.Header.Get("X-Talk-Meta"))
-			if string(params) != `{"name":"profile.jpg","type":"image","ver":"2.0"}` ||
-				string(meta) != `{"profileContext":{"storyShare":false}}` ||
-				req.Header.Get("X-Line-ChannelToken") != "channel-token" || req.Header.Get("x-line-access") != "main-token" ||
-				req.Header.Get("X-Line-Mid") != "UAccount_fake-90" ||
-				req.Header.Get("Content-Type") != "image/gif" {
-				t.Fatalf("unexpected profile upload headers: %v params=%s meta=%s", req.Header, params, meta)
+			if tc.outcome == "" {
+				if err != nil || result == nil {
+					t.Fatalf("expected gateway acceptance, got %v", err)
+				}
+			} else {
+				outcome, _ := ProfileWriteOutcomeOf(err)
+				if err == nil || outcome != tc.outcome {
+					t.Fatalf("outcome=%s err=%v", outcome, err)
+				}
+				if tc.status == 401 && ProfileWriteHTTPStatus(err) != 401 {
+					t.Fatal("missing HTTP status")
+				}
 			}
-			body, _ := io.ReadAll(req.Body)
-			if !bytes.Equal(body, jpegData) {
-				t.Fatal("upload body changed")
-			}
-			if tc.err != nil {
-				return nil, tc.err
-			}
-			resp := obsResponse(tc.status, "")
-			for k, v := range tc.headers {
-				resp.Header.Set(k, v)
-			}
-			return resp, nil
-		})}
-		result, err := client.UploadProfileImageContext(context.Background(), "UAccount_fake-90", jpegData)
-		if requests != 1 {
-			t.Fatalf("%s: requests=%d (no retries allowed)", tc.name, requests)
-		}
-		if tc.ok {
-			if err != nil || result.ObjectID != "oid_1" || result.Hash != "hash-1" {
-				t.Fatalf("%s: %v %+v", tc.name, err, result)
-			}
-			continue
-		}
-		outcome, code := ProfileWriteOutcomeOf(err)
-		if err == nil || outcome != tc.outcome {
-			t.Fatalf("%s: err=%v outcome=%s", tc.name, err, outcome)
-		}
-		wantCode := map[int]string{401: "PROFILE_OBS_UNAUTHORIZED", 403: "PROFILE_OBS_UNAUTHORIZED", 400: "PROFILE_OBS_REJECTED", 500: "PROFILE_OBS_HTTP_UNKNOWN"}[tc.status]
-		if wantCode != "" && (code != wantCode || ProfileWriteHTTPStatus(err) != tc.status) {
-			t.Fatalf("%s: code=%s status=%d", tc.name, code, ProfileWriteHTTPStatus(err))
-		}
+		})
 	}
 }
 
-func TestUploadProfileImageRefusesOtherTargetsBeforeNetwork(t *testing.T) {
+func TestUploadProfileImageNeverUploadsOtherAccountOrUnsafeBytes(t *testing.T) {
+	jpeg := encodeTestImage(t, "jpeg", 8, 8)
 	client := NewClient("main-token")
 	client.HTTPClient = noRPCClient(t)
-	installProfileChannelToken(client)
-	client.OBSClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		t.Fatal("must not reach OBS")
-		return nil, nil
-	})}
-	jpegData := encodeTestImage(t, "jpeg", 8, 8)
+	client.OBSClient = noRPCClient(t)
 	for _, tc := range []struct {
 		mid  string
 		data []byte
 	}{
-		{"cGroup", jpegData}, {"u/../m/x", jpegData}, {"", jpegData},
+		{"cGroup", jpeg}, {"u/../secret", jpeg}, {"", jpeg},
 		{"UAccount", encodeTestImage(t, "png", 8, 8)}, {"UAccount", nil},
 	} {
 		_, err := client.UploadProfileImageContext(context.Background(), tc.mid, tc.data)
@@ -318,33 +315,10 @@ func TestUploadProfileImageRefusesOtherTargetsBeforeNetwork(t *testing.T) {
 			t.Fatalf("mid=%q outcome=%s", tc.mid, outcome)
 		}
 	}
-}
-
-func TestUploadProfileImageTokenUnavailableIsNotSent(t *testing.T) {
-	jpegData := encodeTestImage(t, "jpeg", 8, 8)
-	noOBS := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		t.Fatal("must not reach OBS without both tokens")
-		return nil, nil
-	})}
-	// No main access token: nothing is sent anywhere.
-	client := NewClient("")
-	client.HTTPClient, client.OBSClient = noRPCClient(t), noOBS
-	installProfileChannelToken(client)
-	_, err := client.UploadProfileImageContext(context.Background(), "UAccount_fake-90", jpegData)
+	client = NewClient("")
+	client.HTTPClient, client.OBSClient = noRPCClient(t), noRPCClient(t)
+	_, err := client.UploadProfileImageContext(context.Background(), "UAccount_fake-90", jpeg)
 	if outcome, code := ProfileWriteOutcomeOf(err); outcome != ProfileWriteNotSent || code != "PROFILE_ACCESS_TOKEN_UNAVAILABLE" {
-		t.Fatalf("outcome=%s code=%s", outcome, code)
-	}
-	// Channel token cannot be issued: not sent, OBS never contacted.
-	client = NewClient("main-token")
-	client.OBSClient = noOBS
-	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if !strings.HasSuffix(req.URL.Path, "/ChannelService/approveChannelAndIssueChannelToken") {
-			t.Fatalf("unexpected RPC %s", req.URL.Path)
-		}
-		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"code":1,"message":"channel not approved"}`))}, nil
-	})}
-	_, err = client.UploadProfileImageContext(context.Background(), "UAccount_fake-90", jpegData)
-	if outcome, code := ProfileWriteOutcomeOf(err); outcome != ProfileWriteNotSent || code != "PROFILE_CHANNEL_TOKEN_UNAVAILABLE" {
 		t.Fatalf("outcome=%s code=%s", outcome, code)
 	}
 }
