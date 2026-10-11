@@ -50,8 +50,8 @@ func (f *fakeProfileAPI) readSelf(ctx context.Context, _ *LineClient) (*line.Pro
 }
 
 func (f *fakeProfileAPI) updateAttribute(ctx context.Context, _ *LineClient, attribute int, value string) error {
-	if _, ok := ctx.Deadline(); !ok {
-		panic("profile write without deadline")
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > divaProfileWriteTimeout {
+		panic("profile write without a bounded deadline")
 	}
 	if f.block != nil {
 		<-f.block
@@ -268,6 +268,17 @@ func TestDIVAProfileRequestIDDedupeAndAccountSingleFlight(t *testing.T) {
 	if status, pending := get(resultURL); status != 200 || pending.State != divaProfileStatePending {
 		t.Fatalf("result while in flight: %d %+v", status, pending)
 	}
+	// Elapsed time never removes an in-flight entry: the Worker keeps seeing
+	// "pending" (still running) and must not release its account lock.
+	h.s.mu.Lock()
+	h.s.sweepProfileLocked(time.Now().Add(48 * time.Hour))
+	h.s.mu.Unlock()
+	if status, pending := get(resultURL); status != 200 || pending.State != divaProfileStatePending {
+		t.Fatalf("in-flight entry swept by time: %d %+v", status, pending)
+	}
+	if status, busy := postProfile(t, h, profileBody(newDIVARequestID(), divaProfileOperationName, "第四名")); status != 409 || busy.Code != "PROFILE_ACCOUNT_BUSY" {
+		t.Fatalf("account single flight lost after sweep: %d %+v", status, busy)
+	}
 	close(api.block)
 	h.s.cfg.profileWait = 2 * time.Second
 	status, again := postProfile(t, h, profileBody(requestID, divaProfileOperationName, "新名"))
@@ -397,5 +408,35 @@ func TestDIVAProfileCapabilitiesAndSelfHashesOnly(t *testing.T) {
 	off.s.handler().ServeHTTP(w, r)
 	if !strings.Contains(w.Body.String(), `"enabled_operations":[]`) {
 		t.Fatalf("default must be all off: %s", w.Body.String())
+	}
+}
+
+func TestDIVAProfileResultNotFoundOnlyWithoutEntry(t *testing.T) {
+	api := &fakeProfileAPI{profiles: []*line.Profile{profileSelf("舊名", "", ""), profileSelf("新名", "", "")}}
+	h := profileHarness(t, api, divaProfileOperationName)
+	requestID := newDIVARequestID()
+	get := func(id string) (int, divaProfileResult) {
+		r := httptest.NewRequest(http.MethodGet, "/diva/v1/owner/profile/result?account_mid="+divaProfileTestAccount+"&request_id="+id, nil)
+		r.Header.Set("Authorization", "Bearer "+divaTestToken)
+		w := httptest.NewRecorder()
+		h.s.handler().ServeHTTP(w, r)
+		var result divaProfileResult
+		_ = json.Unmarshal(w.Body.Bytes(), &result)
+		return w.Code, result
+	}
+	// Never received: the Worker may treat this as "cannot be running".
+	if status, result := get(requestID); status != 404 || result.Code != "PROFILE_RESULT_NOT_FOUND" || result.State != divaProfileStateNotSent {
+		t.Fatalf("unknown request: %d %+v", status, result)
+	}
+	postProfile(t, h, profileBody(requestID, divaProfileOperationName, "新名"))
+	// Completed entries stay readable for the TTL, then expire (job long finished).
+	if status, result := get(requestID); status != 200 || result.State != divaProfileStateConfirmed {
+		t.Fatalf("completed request: %d %+v", status, result)
+	}
+	h.s.mu.Lock()
+	h.s.sweepProfileLocked(time.Now().Add(divaProfileResultTTL + time.Minute))
+	h.s.mu.Unlock()
+	if status, result := get(requestID); status != 404 || result.Code != "PROFILE_RESULT_NOT_FOUND" {
+		t.Fatalf("expired request: %d %+v", status, result)
 	}
 }
