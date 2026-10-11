@@ -105,15 +105,13 @@ type divaProfileAPI interface {
 // deliberately bypasses token recovery/re-login: an auth failure is reported.
 type lineProfileAPI struct{}
 
-// Avatar now uses the native Chrome /api/obs/uploadProfile route documented
-// from the 3.7.2 extension. The new cover association/readback response shape
-// is not yet independently verified for this account: leave cover blocked even
-// if accidentally added to the production allow-list. Neither operation is
-// active unless the Worker and Bridge allow-lists both explicitly enable it.
+// The current account has confirmed the Chrome getCover response through
+// authenticated self-only production GET (AI_EXC #140); the background write
+// candidate is now gated by BOTH existing Worker and Bridge operation allow
+// lists, and can only be entered by a fresh OWNER command plus picture.
+// Association still needs a one-shot OWNER E2E verification. Failure or
+// unknown write/readback never triggers an automatic retry.
 func (lineProfileAPI) protocolBlock(operation string) string {
-	if operation == divaProfileOperationCover {
-		return line.ProfileImageProtocolBlocked
-	}
 	return ""
 }
 
