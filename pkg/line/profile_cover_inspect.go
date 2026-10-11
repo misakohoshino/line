@@ -8,13 +8,13 @@ import (
 )
 
 type ProfileCoverInspection struct {
-	HasCoverInfo bool `json:"has_cover_info"`
-	HasHomeID bool `json:"has_home_id"`
-	HasObjectID bool `json:"has_object_id"`
-	HasOID bool `json:"has_oid"`
-	HasNamespace bool `json:"has_namespace"`
-	HasSID bool `json:"has_sid"`
-	IsDefaultCover bool `json:"is_default_cover"`
+	HasCoverInfo    bool `json:"has_cover_info"`
+	HasHomeID       bool `json:"has_home_id"`
+	HasObjectID     bool `json:"has_object_id"`
+	HasOID          bool `json:"has_oid"`
+	HasNamespace    bool `json:"has_namespace"`
+	HasSID          bool `json:"has_sid"`
+	IsDefaultCover  bool `json:"is_default_cover"`
 	ParsedSelfCover bool `json:"parsed_self_cover"`
 }
 
@@ -23,11 +23,17 @@ type ProfileCoverInspection struct {
 func (c *Client) InspectProfileCoverContext(ctx context.Context, selfMID string) (ProfileCoverInspection, error) {
 	info := ProfileCoverInspection{}
 	region, err := c.profileCoverSelfRegion(ctx, selfMID)
-	if err != nil { return info, err }
+	if err != nil {
+		return info, err
+	}
 	token, err := c.acquireProfileChannelTokenContext(ctx)
-	if err != nil { return info, err }
+	if err != nil {
+		return info, err
+	}
 	raw, err := c.profileCoverRequest(ctx, selfMID, region, token, "")
-	if err != nil { return info, err }
+	if err != nil {
+		return info, err
+	}
 	var object map[string]json.RawMessage
 	if json.Unmarshal(raw, &object) != nil || object == nil {
 		return info, profileWriteError(ProfileWriteUnknown, "PROFILE_COVER_RESPONSE_INVALID", nil)
@@ -42,7 +48,9 @@ func (c *Client) InspectProfileCoverContext(ctx context.Context, selfMID string)
 		_, info.HasNamespace = attrs["obsNamespace"]
 		_, info.HasSID = attrs["sid"]
 	}
-	if _, err = parseProfileCover(raw, selfMID); err != nil { return info, err }
+	if _, err = parseProfileCover(raw, selfMID); err != nil {
+		return info, err
+	}
 	info.ParsedSelfCover = true
 	return info, nil
 }
