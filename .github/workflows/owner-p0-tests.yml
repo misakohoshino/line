@@ -1,4 +1,4 @@
-name: OWNER P0/P1 safety tests
+name: OWNER P0/P1/P2 safety tests
 
 on:
   pull_request:
@@ -20,7 +20,7 @@ jobs:
       - name: Install libolm
         run: sudo apt-get update && sudo apt-get install -y libolm-dev
       - name: Formatting
-        run: test -z "$(gofmt -l pkg/connector/diva_inbound_auth*.go pkg/connector/diva_owner*.go pkg/connector/diva_control.go pkg/line/methods.go)"
+        run: test -z "$(gofmt -l pkg/connector/diva_inbound_auth*.go pkg/connector/diva_owner*.go pkg/connector/diva_control.go pkg/line/methods.go pkg/line/profile*.go)"
       - name: Inbound, media, protocol and E2EE regression with race detector
         run: go test -race ./pkg/connector ./pkg/line ./pkg/e2ee
       - name: Vet handwritten packages

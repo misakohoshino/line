@@ -689,6 +689,11 @@ type divaControlConfig struct {
 	// (tests replace it); nil uses LineClient.startDIVARawHistoryReconcile.
 	startRawReconcile func(*LineClient) string
 	listOwnerGroups   func(context.Context, *LineClient) ([]divaJoinedGroup, error)
+	// OWNER P2: allow list from DIVA_OWNER_PROFILE_OPERATIONS (nil = all off),
+	// the LINE profile API (tests replace it) and the bounded HTTP wait.
+	profileOperations map[string]bool
+	profileAPI        divaProfileAPI
+	profileWait       time.Duration
 }
 
 // divaRequestEntry is one request_id: in flight until done is closed, then
@@ -713,9 +718,12 @@ type divaControlServer struct {
 	requests map[string]*divaRequestEntry
 	// lanes holds, per account/chat, the done channel of the last queued
 	// send. A lane is removed when its last send finishes.
-	lanes        map[string]chan struct{}
-	pending      int
-	mediaPending int
+	lanes map[string]chan struct{}
+	// OWNER P2 profile writes: request_id results and per-account single flight.
+	profileRequests map[string]*divaProfileEntry
+	profileBusy     map[string]bool
+	pending         int
+	mediaPending    int
 
 	wg         sync.WaitGroup
 	httpServer *http.Server
@@ -738,6 +746,12 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 	if cfg.mediaMaxConcurrent <= 0 {
 		cfg.mediaMaxConcurrent = divaControlMediaMaxConcurrent
 	}
+	if cfg.profileAPI == nil {
+		cfg.profileAPI = lineProfileAPI{}
+	}
+	if cfg.profileWait <= 0 {
+		cfg.profileWait = divaProfileDefaultWait
+	}
 	if cfg.resolveTarget == nil {
 		cfg.resolveTarget = resolveDIVATarget
 	}
@@ -757,6 +771,9 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 		ownerQuerySem: make(chan struct{}, 2),
 		requests:      map[string]*divaRequestEntry{},
 		lanes:         map[string]chan struct{}{},
+
+		profileRequests: map[string]*divaProfileEntry{},
+		profileBusy:     map[string]bool{},
 	}
 }
 
@@ -768,6 +785,11 @@ func (s *divaControlServer) handler() http.Handler {
 	mux.HandleFunc("/diva/v1/send-media", s.handleSendMedia)
 	mux.HandleFunc("/diva/v1/raw-history/reconcile", s.handleRawHistoryReconcile)
 	mux.HandleFunc("/diva/v1/owner/joined-groups", s.handleOwnerJoinedGroups)
+	mux.HandleFunc("/diva/v1/owner/profile/capabilities", s.handleOwnerProfileCapabilities)
+	mux.HandleFunc("/diva/v1/owner/profile/self", s.handleOwnerProfileSelf)
+	mux.HandleFunc("/diva/v1/owner/profile/update", s.handleOwnerProfileUpdate)
+	mux.HandleFunc("/diva/v1/owner/profile/photo", s.handleOwnerProfilePhoto)
+	mux.HandleFunc("/diva/v1/owner/profile/result", s.handleOwnerProfileResult)
 	return mux
 }
 
@@ -802,12 +824,18 @@ func startDIVAControl(br *bridgev2.Bridge) *divaControlServer {
 			mediaMaxBytes = parsed
 		}
 	}
+	profileOperations, profileErr := parseDIVAProfileOperations(os.Getenv(divaOwnerProfileOperationsEnv))
+	if profileErr != nil {
+		log.Error().Msg("DIVA owner profile operations disabled: invalid DIVA_OWNER_PROFILE_OPERATIONS")
+	}
 	s := newDIVAControlServer(divaControlConfig{
-		token:         token,
-		logins:        br.GetAllCachedUserLogins,
-		log:           log,
-		mediaMaxBytes: mediaMaxBytes,
+		token:             token,
+		logins:            br.GetAllCachedUserLogins,
+		log:               log,
+		mediaMaxBytes:     mediaMaxBytes,
+		profileOperations: profileOperations,
 	})
+	log.Info().Strs("profile_operations", s.enabledProfileOperations()).Msg("DIVA owner profile operations")
 	s.addr = listener.Addr().String()
 	s.httpServer = &http.Server{
 		Handler:           s.handler(),
