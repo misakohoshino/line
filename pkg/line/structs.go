@@ -54,6 +54,7 @@ type Profile struct {
 	AllowSearchByUserID          bool              `json:"allowSearchByUserid"`
 	AllowSearchByEmail           bool              `json:"allowSearchByEmail"`
 	PicturePath                  string            `json:"picturePath"`
+	PictureStatus                string            `json:"pictureStatus"`
 	StatusMessageContentMetadata map[string]string `json:"statusMessageContentMetadata"`
 	NFTProfile                   bool              `json:"nftProfile"`
 	ProfileID                    string            `json:"profileId"`
