@@ -137,10 +137,14 @@ func TestChromeCoverDocumentedReadbackVariants(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseProfileCover([]byte(tc.data), "USelf")
 			if tc.want == "" {
-				if err == nil { t.Fatalf("accepted ambiguous cover %q", got) }
+				if err == nil {
+					t.Fatalf("accepted ambiguous cover %q", got)
+				}
 				return
 			}
-			if err != nil || got != tc.want { t.Fatalf("got %q err %v", got, err) }
+			if err != nil || got != tc.want {
+				t.Fatalf("got %q err %v", got, err)
+			}
 		})
 	}
 }
