@@ -968,6 +968,17 @@ func (lc *LineClient) syncChatsNow(ctx context.Context) {
 	}
 
 	lc.waitForGroupPortalCreates(ctx, pendingPortalCreates)
+	// Reconnect/startup recovery: a pending GROUP invite can predate this session.
+	// The accept function checks a fresh self-invite membership list again.
+	for _, invitedMID := range midsResp.InvitedChatMids {
+		if len(invitedMID) > 0 && (invitedMID[0] == 'c' || invitedMID[0] == 'C') {
+			lc.wg.Add(1)
+			go func(mid string) {
+				defer lc.wg.Done()
+				lc.maybeAutoAcceptGroupInvite(mid)
+			}(invitedMID)
+		}
+	}
 }
 
 func (lc *LineClient) waitForGroupPortalCreates(ctx context.Context, portals []*bridgev2.Portal) {
@@ -1999,6 +2010,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		go func() {
 			defer lc.wg.Done()
 			lc.handleInvite(context.Background(), op.Param1, OperationType(op.Type))
+			lc.maybeAutoAcceptGroupInvite(op.Param1)
 		}()
 
 	case OpChatUpdate, OpChatUpdate2:
