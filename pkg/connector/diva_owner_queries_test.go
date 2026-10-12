@@ -157,9 +157,9 @@ func TestDIVAOwnerEndpointAuthAccountAndNoSend(t *testing.T) {
 }
 
 func TestDIVAOwnerExplicitOpaqueAccountSendParsing(t *testing.T) {
-	body := []byte(`{"version":1,"request_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","target":{"chat_id":"CGroup90","account_mid":"UAccount_fake-90"},"message_type":"text","content":{"text":"MID result"}}`)
+	body := []byte(`{"version":1,"request_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","target":{"chat_id":"CGroup_fake-171","account_mid":"UAccount_fake-90"},"message_type":"text","content":{"text":"MID result"}}`)
 	_, job, err := parseDIVASendRequest(body)
-	if err != nil || job.accountMID != "UAccount_fake-90" || job.chatID != "CGroup90" {
+	if err != nil || job.accountMID != "UAccount_fake-90" || job.chatID != "CGroup_fake-171" {
 		t.Fatalf("explicit opaque account rejected or changed: %v", err)
 	}
 }
