@@ -2668,6 +2668,8 @@ func (lc *LineClient) makeSystemMessageEvent(op line.Operation) (*simplevent.Cha
 }
 
 func (lc *LineClient) handleSystemMessage(op line.Operation) bool {
+	// P4 attribution uses only a live, explicitly addressed self-invite.
+	lc.rememberP4Inviter(op.Message)
 	systemEvent, handled := lc.makeSystemMessageEvent(op)
 	if systemEvent != nil {
 		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, systemEvent)
