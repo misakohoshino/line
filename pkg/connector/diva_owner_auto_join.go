@@ -18,6 +18,36 @@ import (
 
 var divaP4InFlight sync.Map
 
+type divaP4InviterRecord struct {
+  inviter string
+  recorded time.Time
+}
+var divaP4Inviters sync.Map
+
+// Only a LINE system invitation whose explicit invitee is this account can
+// name the inviter. Op123/124 parameters and group creator are not evidence.
+func (lc *LineClient) rememberP4Inviter(msg *line.Message) {
+  if msg == nil || msg.ContentMetadata == nil || !divaChatMIDPattern.MatchString(msg.To) { return }
+  switch msg.ContentMetadata["LOC_KEY"] {
+  case "C_GI", "C_MI", "A_MI":
+  default: return
+  }
+  parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
+  if len(parts) != 2 || !lc.isOwnMID(parts[1]) { return }
+  inviter := parts[0]
+  if !divaUserMIDPattern.MatchString(inviter) || lc.isOwnMID(inviter) || msg.From != inviter { return }
+  divaP4Inviters.Store(string(lc.UserLogin.ID)+"/"+msg.To, divaP4InviterRecord{inviter: inviter, recorded: time.Now()})
+}
+
+func (lc *LineClient) takeP4Inviter(chatMID string) string {
+  key := string(lc.UserLogin.ID)+"/"+chatMID
+  value, ok := divaP4Inviters.LoadAndDelete(key)
+  if !ok { return "" }
+  record, ok := value.(divaP4InviterRecord)
+  if !ok || time.Since(record.recorded) > 2*time.Minute { return "" }
+  return record.inviter
+}
+
 // P4 numeric group-stable ID allows Worker's 90-day ledger to suppress replay
 // from repeated invite operations and reconnects without falsely re-notifying.
 func divaP4EventID(chatMID string) string {
@@ -37,11 +67,27 @@ func (lc *LineClient) p4AnnounceConfirmedJoin(ctx context.Context, client *line.
 			name = n
 		}
 	}
-	eventID := divaP4EventID(chatMID)
+	// System messages may arrive after Op124; wait briefly before finalizing the
+  // inviter field, without delaying LINE membership confirmation itself.
+  select {
+  case <-time.After(2*time.Second):
+  case <-ctx.Done(): return
+  }
+  inviterMID := lc.takeP4Inviter(chatMID)
+  inviterName := ""
+  if inviterMID != "" {
+    if contacts, err := client.GetContactsV2([]string{inviterMID}); err == nil && contacts != nil {
+      if wrapper, ok := contacts.Contacts[inviterMID]; ok {
+        inviterName = strings.TrimSpace(wrapper.Contact.EffectiveDisplayName())
+        if len([]rune(inviterName)) > 80 { inviterName = string([]rune(inviterName)[:80]) }
+      }
+    }
+  }
+  eventID := divaP4EventID(chatMID)
 	fact := map[string]any{
 		"version": 1, "event_type": "owner_group_auto_join",
 		"event_id": eventID, "account_mid": lc.Mid, "group_id": chatMID,
-		"group_name": name, "inviter_mid": "",
+		"group_name": name, "inviter_mid": inviterMID, "inviter_name": inviterName,
 	}
 	lc.forwardDIVAInbound(func() ([]byte, error) { return json.Marshal(fact) }, nil, chatMID, eventID, false)
 	lc.UserLogin.Bridge.Log.Info().Str("p4_case", "confirmed").Msg("P4 self group membership verified; signed owner notice queued")
