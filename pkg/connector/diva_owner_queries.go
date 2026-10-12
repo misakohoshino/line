@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strings"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -22,6 +21,7 @@ type divaJoinedGroup struct {
 }
 
 type divaOwnerGroupReader struct {
+	self  string
 	mids  func(context.Context) (*line.GetAllChatMidsResponse, error)
 	chats func(context.Context, []string) (*line.GetChatsResponse, error)
 }
@@ -33,9 +33,13 @@ func readDIVAOwnerGroups(ctx context.Context, reader divaOwnerGroupReader) ([]di
 	}
 	seen := make(map[string]bool)
 	groups := make([]divaJoinedGroup, 0)
-	// InvitedChatMids is deliberately never read. Rooms are not groups.
+	// Only fresh self member groups are candidates; portals/history are never proof.
 	for _, mid := range mids.MemberChatMids {
-		if !seen[mid] && divaChatMIDPattern.MatchString(mid) && strings.EqualFold(mid[:1], "c") {
+		state, _ := classifyDIVAGroup(mids, nil, reader.self, mid)
+		if state == divaGroupUnknown && isDIVAGroupID(mid) {
+			return nil, errDIVAGroupConflict
+		}
+		if !seen[mid] && state == divaGroupJoined {
 			seen[mid] = true
 			groups = append(groups, divaJoinedGroup{GID: mid})
 		}
@@ -58,6 +62,12 @@ func readDIVAOwnerGroups(ctx context.Context, reader divaOwnerGroupReader) ([]di
 		}
 		for _, chat := range chats.Chats {
 			if index, ok := positions[chat.ChatMid]; ok {
+				if reader.self != "" {
+					state, _ := classifyDIVAGroup(mids, &chat, reader.self, chat.ChatMid)
+					if state != divaGroupJoined {
+						return nil, errDIVAGroupConflict
+					}
+				}
 				groups[index].Name = chat.ChatName
 			}
 		}
@@ -67,14 +77,18 @@ func readDIVAOwnerGroups(ctx context.Context, reader divaOwnerGroupReader) ([]di
 
 func listDIVAOwnerGroups(ctx context.Context, lc *LineClient) ([]divaJoinedGroup, error) {
 	client := lc.newClient()
-	return readDIVAOwnerGroups(ctx, divaOwnerGroupReader{
-		mids: func(ctx context.Context) (*line.GetAllChatMidsResponse, error) {
-			return client.GetAllChatMidsContext(ctx, true, false)
-		},
-		chats: func(ctx context.Context, mids []string) (*line.GetChatsResponse, error) {
-			return client.GetChatsContext(ctx, mids, false, false)
-		},
-	})
+	reader := newDIVAGroupReader(client)
+	for attempt := 0; attempt < 3; attempt++ {
+		groups, err := readDIVAOwnerGroups(ctx, divaOwnerGroupReader{self: lc.Mid, mids: reader.mids, chats: reader.chats})
+		if !errors.Is(err, errDIVAGroupConflict) {
+			return groups, err
+		}
+		lc.UserLogin.Bridge.Log.Warn().Str("group_query_reason", "self_conflict").Int("attempt", attempt+1).Msg("LG fresh membership contradiction")
+		if attempt < 2 && waitDIVAGroup(ctx) != nil {
+			return nil, errDIVAGroupConflict
+		}
+	}
+	return nil, errDIVAGroupConflict
 }
 
 func (s *divaControlServer) handleOwnerJoinedGroups(w http.ResponseWriter, r *http.Request) {

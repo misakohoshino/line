@@ -1004,6 +1004,7 @@ func (lc *LineClient) waitForGroupPortalCreates(ctx context.Context, portals []*
 func (lc *LineClient) setKnownMemberChatMIDs(mids []string) {
 	lc.cacheMu.Lock()
 	defer lc.cacheMu.Unlock()
+	lc.knownMemberChatMIDsReady = true
 	lc.knownMemberChatMIDs = make(map[string]struct{}, len(mids))
 	for _, mid := range mids {
 		if isChatMID(mid) {
@@ -1473,6 +1474,9 @@ func (lc *LineClient) removeGroupMemberFromCache(chatMid, mid string) bool {
 	lc.cacheMu.Lock()
 	defer lc.cacheMu.Unlock()
 
+	if lc.isOwnMID(mid) {
+		delete(lc.knownMemberChatMIDs, chatMid)
+	}
 	members := lc.groupMemberCache[chatMid]
 	if len(members) == 0 {
 		return false
@@ -2001,6 +2005,10 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	case OpNotifiedJoinChat:
 		lc.handleDIVAGroupOperation(op)
 		lc.handleMemberJoin(op.Param1, op.Param2)
+		if lc.isOwnMID(op.Param2) {
+			lc.wg.Add(1)
+			go func() { defer lc.wg.Done(); lc.maybeAutoAcceptGroupInvite(op.Param1) }()
+		}
 
 	case OpCancelInvitation:
 		lc.handleMemberLeave(op.Param1, op.Param3)
@@ -2367,6 +2375,7 @@ func (lc *LineClient) handleSelfLeave(chatMid string) {
 func (lc *LineClient) handleSelfLeaveWithSender(chatMid string, changeSender bridgev2.EventSender) {
 	lc.cacheMu.Lock()
 	delete(lc.groupMemberCache, chatMid)
+	delete(lc.knownMemberChatMIDs, chatMid)
 	lc.cacheMu.Unlock()
 	lc.emitMemberChangeWithSender(
 		chatMid,

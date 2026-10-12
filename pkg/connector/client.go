@@ -70,17 +70,18 @@ type LineClient struct {
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
 	// noE2EEGroups, groupMemberCache, generatedGroupNameCache, and knownMemberChatMIDs.
 	// Hold it only around map accesses; never across network calls.
-	cacheMu                 sync.Mutex
-	blockedUsers            map[string]bool      // mid -> true if the user has blocked this contact in LINE
-	noE2EEGroups            map[string]time.Time // chatMid -> when group E2EE failure was cached
-	contactCache            map[string]cachedContact
-	mediaFlowCache          map[string]cachedMediaFlow
-	groupMemberCache        map[string][]string // chatMid -> list of member MIDs from CreateGroup or getChatMemberMIDs
-	generatedGroupNameCache map[string]bool     // chatMid -> true when Matrix name should be generated from member names
-	knownMemberChatMIDs     map[string]struct{} // chatMid -> current member chats returned by getAllChatMids
-	reactionIconMXC         map[int]string      // predefinedReactionType -> cached MXC URI
-	paidReactionIconMXC     map[string]string   // LINE sticon URL -> cached MXC URI
-	unblockBackfills        sync.Map            // chat MID -> *unblockBackfillState while unblock history restoration is active
+	cacheMu                  sync.Mutex
+	blockedUsers             map[string]bool      // mid -> true if the user has blocked this contact in LINE
+	noE2EEGroups             map[string]time.Time // chatMid -> when group E2EE failure was cached
+	contactCache             map[string]cachedContact
+	mediaFlowCache           map[string]cachedMediaFlow
+	groupMemberCache         map[string][]string // chatMid -> list of member MIDs from CreateGroup or getChatMemberMIDs
+	generatedGroupNameCache  map[string]bool     // chatMid -> true when Matrix name should be generated from member names
+	knownMemberChatMIDsReady bool
+	knownMemberChatMIDs      map[string]struct{} // chatMid -> current member chats returned by getAllChatMids
+	reactionIconMXC          map[int]string      // predefinedReactionType -> cached MXC URI
+	paidReactionIconMXC      map[string]string   // LINE sticon URL -> cached MXC URI
+	unblockBackfills         sync.Map            // chat MID -> *unblockBackfillState while unblock history restoration is active
 
 	// divaGroupLeaveMu protects divaGroupLeaves, the short-lived DIVA-only
 	// markers that let a kick's op 133 + op 61 reach DIVA as one member_removed.

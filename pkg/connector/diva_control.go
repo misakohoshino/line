@@ -72,7 +72,7 @@ var (
 	// lengths that are not the old fixed 33-char test shape. Keep only the
 	// business boundary here: group/room (c/C/r/R) allowed, direct user
 	// targets (u/U) refused. The shared send core remains the format authority.
-	divaChatMIDPattern = regexp.MustCompile(`^[cCrR][0-9A-Za-z]+$`)
+	divaChatMIDPattern = regexp.MustCompile(`^[cCrR][0-9A-Za-z_-]+$`)
 	// divaUserMIDPattern accepts LINE user MIDs (target.account_mid) as
 	// opaque identifiers too: Production account MIDs use uppercase U and
 	// contain '_' / '-'. The MID is passed through unchanged, never lowercased.
