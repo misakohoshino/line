@@ -55,7 +55,7 @@ func classifyDIVAGroup(mids *line.GetAllChatMidsResponse, chat *line.Chat, self,
 			return divaGroupPending, "self_list"
 		}
 		if selfMember {
-			return divaGroupJoined, "self_chat"
+			return divaGroupUnknown, "self_list_not_yet_joined"
 		}
 		// A detail-only invite is not sufficient authority to accept an invitation.
 		if selfPending {
@@ -98,10 +98,10 @@ func waitDIVAGroup(ctx context.Context) error {
 	}
 }
 
-// At most one accept, three fresh checks. Detail-only auto-join needs two
-// consecutive independent self snapshots. Conflicts/errors never mean success.
+// At most one accept, three fresh checks. GetChats-only membership is never
+// sufficient: wait for the authenticated self list. Conflicts/errors fail closed.
 func reconcileDIVAP4(ctx context.Context, reader divaGroupReader, self, gid string, accept func() error, wait func(context.Context) error) (divaGroupState, bool, string) {
-	accepted, detailConfirmed := false, false
+	accepted := false
 	reason := "unverified"
 	lastState := divaGroupUnknown
 	for attempt := 0; attempt < 3; attempt++ {
@@ -111,25 +111,19 @@ func reconcileDIVAP4(ctx context.Context, reader divaGroupReader, self, gid stri
 		mids, err := reader.mids(ctx)
 		if err != nil || mids == nil {
 			reason = "list_unavailable"
-			detailConfirmed = false
 			lastState = divaGroupUnknown
 		} else {
 			chats, fetchErr := reader.chats(ctx, []string{gid})
 			if fetchErr != nil || chats == nil || len(chats.Chats) != 1 {
 				reason = "detail_unavailable"
-				detailConfirmed = false
 				lastState = divaGroupUnknown
 			} else {
 				state, why := classifyDIVAGroup(mids, &chats.Chats[0], self, gid)
 				reason = why
 				lastState = state
 				if state == divaGroupJoined {
-					if why == "self_list" || detailConfirmed {
-						return state, accepted, why
-					}
-					detailConfirmed = true
+					return state, accepted, why
 				} else {
-					detailConfirmed = false
 					if state == divaGroupPending && !accepted {
 						if accept == nil || accept() != nil {
 							return divaGroupUnknown, false, "accept_failed"

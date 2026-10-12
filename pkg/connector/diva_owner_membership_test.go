@@ -35,7 +35,7 @@ func TestDIVAGroupCurrentChromeOpaqueIDsAndStates(t *testing.T) {
 		{true, false, true, false, divaGroupJoined}, {false, true, false, true, divaGroupPending},
 		{false, false, false, false, divaGroupLeft}, {true, true, true, false, divaGroupUnknown},
 		{true, false, false, true, divaGroupUnknown}, {false, true, true, false, divaGroupUnknown},
-		{false, false, true, true, divaGroupUnknown}, {false, false, true, false, divaGroupJoined},
+		{false, false, true, true, divaGroupUnknown}, {false, false, true, false, divaGroupUnknown},
 		{false, false, false, true, divaGroupUnknown},
 	} {
 		c := group171(tc.cm, tc.cp)
@@ -70,7 +70,8 @@ func TestDIVAP4ReconciliationBranches(t *testing.T) {
 		{"manual_accept", []snapshot{{list171(true, false), joined, false}}, divaGroupJoined, 0, 1},
 		{"explicit_accept", []snapshot{{list171(false, true), pending, false}, {list171(true, false), joined, false}}, divaGroupJoined, 1, 2},
 		{"accept_unconfirmed", []snapshot{{list171(false, true), pending, false}}, divaGroupPending, 1, 3},
-		{"detail_before_list", []snapshot{{list171(false, false), joined, false}}, divaGroupJoined, 0, 2},
+		{"detail_before_list", []snapshot{{list171(false, false), joined, false}, {list171(true, false), joined, false}}, divaGroupJoined, 0, 2},
+		{"old_portal_self_detail_only", []snapshot{{list171(false, false), joined, false}}, divaGroupUnknown, 0, 3},
 		{"old_portal_or_left", []snapshot{{list171(false, false), left, false}}, divaGroupLeft, 0, 3},
 		{"other_invitee", []snapshot{{list171(false, false), pending, false}}, divaGroupUnknown, 0, 3},
 		{"contradiction", []snapshot{{list171(true, false), pending, false}}, divaGroupUnknown, 0, 3},
