@@ -1,8 +1,6 @@
 name: OWNER P0/P1/P2 safety tests
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
