@@ -1,16 +1,66 @@
 name: OWNER P0/P1/P2 safety tests
 
 on:
+  issue_comment:
+    types: [created]
   workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   safety:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'issue_comment' &&
+         github.event.issue.pull_request &&
+         startsWith(github.event.comment.body, '/test ') &&
+         (github.event.comment.user.login == github.repository_owner ||
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR'))
+      }}
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve requested Go test groups and PR HEAD
+        if: ${{ github.event_name == 'issue_comment' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_TEXT: ${{ github.event.comment.body }}
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess, sys
+          parts = os.environ["COMMENT_TEXT"].strip().split()
+          allowed = {"format", "connector", "line", "e2ee", "vet", "build"}
+          if (not 2 <= len(parts) <= 7 or parts[0] != "/test"
+                  or len(set(parts[1:])) != len(parts[1:])
+                  or any(x not in allowed for x in parts[1:])):
+              sys.exit("Expected /test format connector line e2ee vet build (select some)")
+          number = os.environ["PR_NUMBER"]
+          if not re.fullmatch(r"[1-9][0-9]*", number):
+              sys.exit("Invalid PR number")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          data = json.loads(subprocess.check_output(["gh", "api", f"repos/{repo}/pulls/{number}"]))
+          if (data["state"] != "open" or data["base"]["ref"] != "main"
+                  or data["head"]["repo"]["full_name"] != repo):
+              sys.exit("PR must be open, target main and use this repository")
+          packages = [f"./pkg/{x}" for x in ("connector", "line", "e2ee") if x in parts[1:]]
+          with open(os.environ["GITHUB_ENV"], "a") as out:
+              out.write(f'PR_HEAD_SHA={data["head"]["sha"]}\n')
+              out.write('TEST_GROUPS= ' + ' '.join(parts[1:]) + ' \n')
+              out.write('GO_TEST_PACKAGES=' + ' '.join(packages) + '\n')
+          PY
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26.x'
@@ -18,10 +68,19 @@ jobs:
       - name: Install libolm
         run: sudo apt-get update && sudo apt-get install -y libolm-dev
       - name: Formatting
+        if: ${{ github.event_name == 'workflow_dispatch' || contains(env.TEST_GROUPS, ' format ') }}
         run: test -z "$(gofmt -l pkg/connector/diva_inbound_auth*.go pkg/connector/diva_owner*.go pkg/connector/diva_control.go pkg/line/methods.go pkg/line/profile*.go)"
-      - name: Inbound, media, protocol and E2EE regression with race detector
-        run: go test -race ./pkg/connector ./pkg/line ./pkg/e2ee
+      - name: Selected inbound / protocol / E2EE regression with race detector
+        if: ${{ github.event_name == 'workflow_dispatch' || contains(env.TEST_GROUPS, ' connector ') || contains(env.TEST_GROUPS, ' line ') || contains(env.TEST_GROUPS, ' e2ee ') }}
+        run: |
+          if [ -n "${GO_TEST_PACKAGES:-}" ]; then
+            go test -race $GO_TEST_PACKAGES
+          else
+            go test -race ./pkg/connector ./pkg/line ./pkg/e2ee
+          fi
       - name: Vet handwritten packages
+        if: ${{ github.event_name == 'workflow_dispatch' || contains(env.TEST_GROUPS, ' vet ') }}
         run: go vet $(go list ./... | grep -v /ltsm)
       - name: Build bridge
+        if: ${{ github.event_name == 'workflow_dispatch' || contains(env.TEST_GROUPS, ' build ') }}
         run: go build -o /tmp/matrix-line ./cmd/matrix-line
