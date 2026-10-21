@@ -10,7 +10,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'issue_comment' && github.event.comment.id || github.ref }}
   cancel-in-progress: true
 
 jobs:
