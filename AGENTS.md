@@ -10,6 +10,8 @@ The bridge identifies as a LINE Chrome Extension client, so it cannot coexist wi
 
 ## Build & Development
 
+**DIVA 施工測試限制：** Claude／Work 在施工或比對修改前後時，不得自行執行完整本機測試（例如 `go test ./...`）或全套 Actions；合併前由 GPT 指定必要測試檔案並透過 PR `/test pkg/.../*_test.go` 執行。除非使用者明確指定擴大測試，否則禁止全套測試。
+
 **Requirements:** Go 1.26+, libolm (`libolm-dev` on Ubuntu, `olm` via Homebrew on macOS)
 
 **Build:**
