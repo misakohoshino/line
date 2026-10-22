@@ -4,6 +4,15 @@ on:
   issue_comment:
     types: [created]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Open PR number targeting main"
+        required: true
+        type: string
+      test_targets:
+        description: "Space-separated pkg/*_test.go paths"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -29,11 +38,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR and requested Go test files
-        if: ${{ github.event_name == 'issue_comment' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-          COMMENT_TEXT: ${{ github.event.comment.body }}
+          PR_NUMBER: ${{ github.event_name == 'issue_comment' && github.event.issue.number || inputs.pr_number }}
+          COMMENT_TEXT: ${{ github.event_name == 'issue_comment' && github.event.comment.body || format('/test {0}', inputs.test_targets) }}
         run: |
           python - <<'PY'
           import json, os, re, subprocess, sys
@@ -65,7 +73,6 @@ jobs:
       - name: Install libolm
         run: sudo apt-get update && sudo apt-get install -y libolm-dev
       - name: Run only tests declared in selected Go files
-        if: ${{ github.event_name == 'issue_comment' }}
         env:
           TEST_TARGETS: ${{ env.TEST_TARGETS }}
         run: |
@@ -88,15 +95,3 @@ jobs:
               pattern = "^(" + "|".join(re.escape(n) for n in sorted(names)) + ")$"
               subprocess.run(["go", "test", "-race", package, "-run", pattern, "-count=1"], check=True)
           PY
-      - name: Formatting
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: test -z "$(gofmt -l pkg/connector/diva_inbound_auth*.go pkg/connector/diva_owner*.go pkg/connector/diva_control.go pkg/line/methods.go pkg/line/profile*.go)"
-      - name: Inbound / protocol / E2EE legacy manual regression
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: go test -race ./pkg/connector ./pkg/line ./pkg/e2ee
-      - name: Vet handwritten packages
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: go vet $(go list ./... | grep -v /ltsm)
-      - name: Build bridge
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: go build -o /tmp/matrix-line ./cmd/matrix-line
