@@ -689,6 +689,9 @@ type divaControlConfig struct {
 	// (tests replace it); nil uses LineClient.startDIVARawHistoryReconcile.
 	startRawReconcile func(*LineClient) string
 	listOwnerGroups   func(context.Context, *LineClient) ([]divaJoinedGroup, error)
+	// Dispatch round 2: group member lookup for /diva/v1/group/member-check
+	// (tests replace it); nil uses lookupDIVAGroupMembers.
+	groupMembers func(context.Context, *LineClient, string) (divaGroupMembers, error)
 	// OWNER P2: allow list from DIVA_OWNER_PROFILE_OPERATIONS (nil = all off),
 	// the LINE profile API (tests replace it) and the bounded HTTP wait.
 	profileOperations map[string]bool
@@ -713,6 +716,8 @@ type divaControlServer struct {
 	sem           chan struct{}
 	mediaSem      chan struct{}
 	ownerQuerySem chan struct{}
+	// memberCheckSem bounds concurrent /diva/v1/group/member-check LINE reads.
+	memberCheckSem chan struct{}
 
 	mu       sync.Mutex
 	requests map[string]*divaRequestEntry
@@ -762,15 +767,16 @@ func newDIVAControlServer(cfg divaControlConfig) *divaControlServer {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &divaControlServer{
-		cfg:           cfg,
-		tokenHash:     sha256.Sum256([]byte(cfg.token)),
-		baseCtx:       ctx,
-		cancel:        cancel,
-		sem:           make(chan struct{}, cfg.maxConcurrent),
-		mediaSem:      make(chan struct{}, cfg.mediaMaxConcurrent),
-		ownerQuerySem: make(chan struct{}, 2),
-		requests:      map[string]*divaRequestEntry{},
-		lanes:         map[string]chan struct{}{},
+		cfg:            cfg,
+		tokenHash:      sha256.Sum256([]byte(cfg.token)),
+		baseCtx:        ctx,
+		cancel:         cancel,
+		sem:            make(chan struct{}, cfg.maxConcurrent),
+		mediaSem:       make(chan struct{}, cfg.mediaMaxConcurrent),
+		ownerQuerySem:  make(chan struct{}, 2),
+		memberCheckSem: make(chan struct{}, 2),
+		requests:       map[string]*divaRequestEntry{},
+		lanes:          map[string]chan struct{}{},
 
 		profileRequests: map[string]*divaProfileEntry{},
 		profileBusy:     map[string]bool{},
@@ -785,6 +791,7 @@ func (s *divaControlServer) handler() http.Handler {
 	mux.HandleFunc("/diva/v1/send-media", s.handleSendMedia)
 	mux.HandleFunc("/diva/v1/raw-history/reconcile", s.handleRawHistoryReconcile)
 	mux.HandleFunc("/diva/v1/owner/joined-groups", s.handleOwnerJoinedGroups)
+	mux.HandleFunc("/diva/v1/group/member-check", s.handleGroupMemberCheck)
 	mux.HandleFunc("/diva/v1/owner/profile/capabilities", s.handleOwnerProfileCapabilities)
 	mux.HandleFunc("/diva/v1/owner/profile/self", s.handleOwnerProfileSelf)
 	mux.HandleFunc("/diva/v1/owner/profile/cover/inspect", s.handleOwnerProfileCoverInspect)
