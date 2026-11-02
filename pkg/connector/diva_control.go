@@ -692,6 +692,8 @@ type divaControlConfig struct {
 	// Dispatch round 2: group member lookup for /diva/v1/group/member-check
 	// (tests replace it); nil uses lookupDIVAGroupMembers.
 	groupMembers func(context.Context, *LineClient, string) (divaGroupMembers, error)
+	// #333 員工頭像：聯絡人查詢 for /diva/v1/contact/picture（tests replace it）；nil uses lookupDIVAContact.
+	contactLookup func(context.Context, *LineClient, string) (line.Contact, error)
 	// OWNER P2: allow list from DIVA_OWNER_PROFILE_OPERATIONS (nil = all off),
 	// the LINE profile API (tests replace it) and the bounded HTTP wait.
 	profileOperations map[string]bool
@@ -792,6 +794,7 @@ func (s *divaControlServer) handler() http.Handler {
 	mux.HandleFunc("/diva/v1/raw-history/reconcile", s.handleRawHistoryReconcile)
 	mux.HandleFunc("/diva/v1/owner/joined-groups", s.handleOwnerJoinedGroups)
 	mux.HandleFunc("/diva/v1/group/member-check", s.handleGroupMemberCheck)
+	mux.HandleFunc("/diva/v1/contact/picture", s.handleContactPicture)
 	mux.HandleFunc("/diva/v1/owner/profile/capabilities", s.handleOwnerProfileCapabilities)
 	mux.HandleFunc("/diva/v1/owner/profile/self", s.handleOwnerProfileSelf)
 	mux.HandleFunc("/diva/v1/owner/profile/cover/inspect", s.handleOwnerProfileCoverInspect)
