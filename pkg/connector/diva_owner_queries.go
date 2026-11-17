@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -18,6 +19,21 @@ import (
 type divaJoinedGroup struct {
 	GID  string `json:"gid"`
 	Name string `json:"name"`
+	// PicturePath：LINE 群組照片路徑（https://profile.line-scdn.net 後面那段，DC 配合群列表顯示群組照片用；
+	// DC docs/decisions/36 §15）。有拿到群組資料才有這一欄：""＝群組沒設照片；沒有這一欄＝這次沒拿到，呼叫端不要動舊的。
+	PicturePath *string `json:"picture_path,omitempty"`
+}
+
+// divaGroupPicturePath 只放行看起來像路徑的群組照片路徑；其他（含沒設）一律回 ""。
+func divaGroupPicturePath(raw string) string {
+	path := strings.TrimSpace(raw)
+	if path != "" && !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if !divaPicturePathPattern.MatchString(path) {
+		return ""
+	}
+	return path
 }
 
 type divaOwnerGroupReader struct {
@@ -69,6 +85,8 @@ func readDIVAOwnerGroups(ctx context.Context, reader divaOwnerGroupReader) ([]di
 					}
 				}
 				groups[index].Name = chat.ChatName
+				picture := divaGroupPicturePath(chat.PicturePath)
+				groups[index].PicturePath = &picture
 			}
 		}
 	}
