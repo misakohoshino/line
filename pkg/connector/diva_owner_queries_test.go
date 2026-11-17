@@ -31,7 +31,7 @@ func TestDIVAOwnerJoinedMembershipNamesAndBatches(t *testing.T) {
 			if calls == 2 {
 				return nil, errors.New("name lookup failed")
 			}
-			return &line.GetChatsResponse{Chats: []line.Chat{{ChatMid: batch[0], ChatName: "😀群"}, {ChatMid: "cInvited", ChatName: "not a member"}}}, nil
+			return &line.GetChatsResponse{Chats: []line.Chat{{ChatMid: batch[0], ChatName: "😀群", PicturePath: "0hGroupPic"}, {ChatMid: "cInvited", ChatName: "not a member"}, {ChatMid: batch[1], ChatName: "沒照片", PicturePath: "bad path!"}}}, nil
 		},
 	})
 	if err != nil || len(groups) != 46 || calls != 3 {
@@ -44,6 +44,16 @@ func TestDIVAOwnerJoinedMembershipNamesAndBatches(t *testing.T) {
 	}
 	if groups[0].Name != "😀群" || groups[20].Name != "" || groups[40].Name != "😀群" {
 		t.Fatalf("name failures did not preserve member list: %+v", groups)
+	}
+	// DC 36 §15：拿到群組資料才帶照片路徑（補 "/"、不像路徑的當沒設＝""）；這次沒拿到（第 2 批失敗）＝沒有這一欄
+	if p := groups[0].PicturePath; p == nil || *p != "/0hGroupPic" {
+		t.Fatalf("picture path not passed through: %+v", groups[0])
+	}
+	if p := groups[1].PicturePath; p == nil || *p != "" {
+		t.Fatalf("invalid picture path must become empty: %+v", groups[1])
+	}
+	if groups[20].PicturePath != nil || groups[2].PicturePath != nil {
+		t.Fatalf("unfetched group must omit picture path: %+v %+v", groups[20], groups[2])
 	}
 }
 
