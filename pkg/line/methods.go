@@ -953,6 +953,25 @@ func (c *Client) AcceptChatInvitation(reqSeq int64, chatMid string) error {
 	return err
 }
 
+// DeleteSelfFromChatContext makes the logged-in account leave a LINE group
+// chat (TalkService.deleteSelfFromChat; same request shape as LINEJS / CHRLINE:
+// reqSeq + chatMid). One call only: callers must read membership back to know
+// whether the leave really happened.
+func (c *Client) DeleteSelfFromChatContext(ctx context.Context, reqSeq int64, chatMid string) error {
+	resp, err := c.callRPCContext(ctx, "TalkService", "deleteSelfFromChat", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(resp, &wrapper) == nil && wrapper.Code != 0 {
+		return fmt.Errorf("deleteSelfFromChat error code=%d", wrapper.Code)
+	}
+	return nil
+}
+
 // RejectChatInvitation declines a pending invitation into a LINE group chat.
 func (c *Client) RejectChatInvitation(reqSeq int64, chatMid string) error {
 	_, err := c.callRPC("TalkService", "rejectChatInvitation", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})

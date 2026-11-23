@@ -689,6 +689,8 @@ type divaControlConfig struct {
 	// (tests replace it); nil uses LineClient.startDIVARawHistoryReconcile.
 	startRawReconcile func(*LineClient) string
 	listOwnerGroups   func(context.Context, *LineClient) ([]divaJoinedGroup, error)
+	// OWNER P3 退群 for /diva/v1/owner/leave-group (tests replace it); nil uses leaveDIVAOwnerGroup.
+	leaveOwnerGroup func(context.Context, *LineClient, string) divaLeaveOutcome
 	// Dispatch round 2: group member lookup for /diva/v1/group/member-check
 	// (tests replace it); nil uses lookupDIVAGroupMembers.
 	groupMembers func(context.Context, *LineClient, string) (divaGroupMembers, error)
@@ -793,6 +795,7 @@ func (s *divaControlServer) handler() http.Handler {
 	mux.HandleFunc("/diva/v1/send-media", s.handleSendMedia)
 	mux.HandleFunc("/diva/v1/raw-history/reconcile", s.handleRawHistoryReconcile)
 	mux.HandleFunc("/diva/v1/owner/joined-groups", s.handleOwnerJoinedGroups)
+	mux.HandleFunc("/diva/v1/owner/leave-group", s.handleOwnerLeaveGroup)
 	mux.HandleFunc("/diva/v1/group/member-check", s.handleGroupMemberCheck)
 	mux.HandleFunc("/diva/v1/contact/picture", s.handleContactPicture)
 	mux.HandleFunc("/diva/v1/owner/profile/capabilities", s.handleOwnerProfileCapabilities)
