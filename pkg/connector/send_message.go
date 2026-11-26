@@ -88,6 +88,9 @@ type lineOutboundRequest struct {
 	// ReplyFallback resends without the reply relation when LINE cannot find
 	// the reply target. When false, that failure is returned as an error.
 	ReplyFallback bool
+	// ContactMID and ContactName are the card for ContentContact (好友資訊).
+	ContactMID  string
+	ContactName string
 }
 
 // outboundMedia describes media for the send core. Either Data is set, or Load
@@ -301,6 +304,14 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 	contentMetadata := map[string]string{}
 	if !plainText {
 		contentMetadata["e2eeVersion"] = "2"
+	}
+
+	// Contact cards (好友資訊) are not end-to-end encrypted on LINE: incoming
+	// ones carry mid/displayName in plain contentMetadata (handlers/contact.go),
+	// so they are sent the same way (ServerB docs/26 §1F, AI_EXC #539).
+	if req.ContentType == ContentContact {
+		plainText = true
+		delete(contentMetadata, "e2eeVersion")
 	}
 
 	// For non-text messages, check with the server whether to use E2EE or plain media upload.
@@ -727,6 +738,13 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 				Msg("Prepared audio message")
 		}
 
+	case ContentContact:
+		contentType = int(ContentContact)
+		contentMetadata["mid"] = req.ContactMID
+		if req.ContactName != "" {
+			contentMetadata["displayName"] = req.ContactName
+		}
+
 	default:
 		return nil, markOutboundFailure(failUnsupportedType, fmt.Errorf("content type %d not implemented", req.ContentType))
 	}
@@ -829,7 +847,7 @@ func (lc *LineClient) sendLineOutbound(ctx context.Context, req *lineOutboundReq
 		SessionID:       0,
 		CreatedTime:     json.Number(strconv.FormatInt(now, 10)),
 		ContentType:     contentType,
-		HasContent:      contentType != int(ContentText),
+		HasContent:      contentType != int(ContentText) && contentType != int(ContentContact),
 		ContentMetadata: contentMetadata,
 	}
 

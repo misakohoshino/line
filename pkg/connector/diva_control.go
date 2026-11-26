@@ -120,6 +120,16 @@ type divaTextContent struct {
 	Text string `json:"text"`
 }
 
+// divaContactContent is the content of a contact card: the user MID as this
+// account sees it (passed through unchanged) and the name shown on the card.
+type divaContactContent struct {
+	MID         string `json:"mid"`
+	DisplayName string `json:"display_name"`
+}
+
+// divaContactNameMaxRunes bounds the display name on a contact card.
+const divaContactNameMaxRunes = 100
+
 // divaSendMediaMetadata is the strict JSON metadata part of /diva/v1/send-media.
 // The binary media bytes travel in a separate multipart part and are never
 // base64-encoded into the existing text JSON contract.
@@ -146,9 +156,12 @@ type divaSendMediaMetadata struct {
 }
 
 const (
-	divaReplyFallbackFail   = "fail"
-	divaReplyFallbackDrop   = "send_without_reply"
-	divaMessageTypeText     = "text"
+	divaReplyFallbackFail = "fail"
+	divaReplyFallbackDrop = "send_without_reply"
+	divaMessageTypeText   = "text"
+	// divaMessageTypeContact sends a LINE contact card (好友資訊／名片) on /diva/v1/send
+	// (ServerB docs/26 §1F, AI_EXC #539).
+	divaMessageTypeContact  = "contact"
 	divaMessageTypeImage    = "image"
 	divaMessageTypeVideo    = "video"
 	divaMessageTypeAudio    = "audio"
@@ -207,11 +220,14 @@ func parseDIVASendRequest(body []byte) (*divaSendRequest, *divaSendJob, *divaReq
 			return &raw, nil, invalidRequest("target.account_mid must be a LINE user MID or null")
 		}
 	}
+	if raw.MessageType == divaMessageTypeContact {
+		return parseDIVAContactRequest(&raw, accountMID)
+	}
 	if raw.MessageType != divaMessageTypeText {
 		return &raw, nil, &divaRequestError{
 			status: http.StatusBadRequest,
 			code:   outboundUnsupportedMessageType,
-			detail: fmt.Sprintf("message_type %q is not supported; only %q", raw.MessageType, divaMessageTypeText),
+			detail: fmt.Sprintf("message_type %q is not supported; only %q or %q", raw.MessageType, divaMessageTypeText, divaMessageTypeContact),
 		}
 	}
 
@@ -282,6 +298,59 @@ func parseDIVASendRequest(body []byte) (*divaSendRequest, *divaSendJob, *divaReq
 	}{accountMID, raw.Target.ChatID, raw.MessageType, content.Text, replyTo, replyFallback, mentions, mentionAll})
 	job.fingerprint = sha256.Sum256(fp)
 	return &raw, job, nil
+}
+
+// parseDIVAContactRequest builds the send job for a contact card (好友資訊／名片;
+// ServerB docs/26 §1F, AI_EXC #539: DC "加拒收／加問題" makes Server A drop the
+// driver's card into the reject group). content is {"mid", "display_name"}.
+// Reply and mention relations are not supported for contact cards. It never
+// touches LINE.
+func parseDIVAContactRequest(raw *divaSendRequest, accountMID string) (*divaSendRequest, *divaSendJob, *divaRequestError) {
+	var content divaContactContent
+	dec := json.NewDecoder(bytes.NewReader(raw.Content))
+	dec.DisallowUnknownFields()
+	if len(raw.Content) == 0 || dec.Decode(&content) != nil {
+		return raw, nil, invalidRequest("content must be {\"mid\": \"...\", \"display_name\": \"...\"}")
+	}
+	if !divaUserMIDPattern.MatchString(content.MID) {
+		return raw, nil, invalidRequest("content.mid must be a LINE user MID")
+	}
+	name := strings.TrimSpace(content.DisplayName)
+	if len([]rune(name)) > divaContactNameMaxRunes {
+		return raw, nil, invalidRequest("content.display_name must be at most %d characters", divaContactNameMaxRunes)
+	}
+	if raw.Relations != nil && (raw.Relations.ReplyTo != nil || len(raw.Relations.Mentions) > 0 || raw.Relations.MentionAll) {
+		return raw, nil, invalidRequest("relations are not supported for contact messages")
+	}
+	wait := divaControlDefaultWait
+	if raw.Options != nil {
+		switch raw.Options.ReplyFallback {
+		case "", divaReplyFallbackFail, divaReplyFallbackDrop:
+		default:
+			return raw, nil, invalidRequest("options.reply_fallback must be %q or %q", divaReplyFallbackFail, divaReplyFallbackDrop)
+		}
+		if raw.Options.TimeoutMS != nil {
+			wait = time.Duration(*raw.Options.TimeoutMS) * time.Millisecond
+			wait = max(divaControlMinWait, min(wait, divaControlMaxWait))
+		}
+	}
+	job := &divaSendJob{
+		requestID:  raw.RequestID,
+		accountMID: accountMID,
+		chatID:     raw.Target.ChatID,
+		wait:       wait,
+		req: &lineOutboundRequest{
+			ChatMID:     raw.Target.ChatID,
+			ContentType: ContentContact,
+			ContactMID:  content.MID,
+			ContactName: name,
+		},
+	}
+	fp, _ := json.Marshal(struct {
+		AccountMID, ChatID, MessageType, ContactMID, ContactName string
+	}{accountMID, raw.Target.ChatID, raw.MessageType, content.MID, name})
+	job.fingerprint = sha256.Sum256(fp)
+	return raw, job, nil
 }
 
 // parseDIVASendMediaMetadata validates media metadata/binary and builds
